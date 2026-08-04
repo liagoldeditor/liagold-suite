@@ -1,12 +1,14 @@
 // ==UserScript==
 // @name         LiaGold Suite — Totalizer + Scanner (Unified)
 // @namespace    liagold.suite.unified
-// @version      1.0.4
-// @description  Gabungan LiaGold Totalizer + LiaGold Scanner dengan page detection + advanced bug fixes + UX polish
+// @version      1.0.5
+// @description  Gabungan LiaGold Totalizer + LiaGold Scanner dengan page detection + bug fixes + UX polish
 // @match        https://liagold.cuan.co/*
 // @match        http://liagold.cuan.co/*
 // @run-at       document-idle
 // @grant        none
+// @updateURL    https://raw.githubusercontent.com/liagoldeditor/liagold-suite/main/liagold-suite.user.js
+// @downloadURL  https://raw.githubusercontent.com/liagoldeditor/liagold-suite/main/liagold-suite.user.js
 // ==/UserScript==
 
 (function () {
