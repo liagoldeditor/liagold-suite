@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         LiaGold Suite — Totalizer + Scanner (Unified)
 // @namespace    liagold.suite.unified
-// @version      1.0.6
-// @description  Gabungan LiaGold Totalizer + LiaGold Scanner dengan page detection + bug fixes + UX polish
+// @version      1.0.8
+// @description  Gabungan LiaGold Totalizer + LiaGold Scanner dengan selection memory + anti-blink + bug fixes
 // @match        https://liagold.cuan.co/*
 // @match        http://liagold.cuan.co/*
 // @run-at       document-idle
@@ -259,7 +259,55 @@
       let prevCount = 0;
       let lastSum = 0;
 
-      function update() {
+      // ✅ FIX v1.0.8: Selection Memory - simpan state seleksi biar gak ilang pas Angular re-render
+      const selectionMemory = new Map();
+
+      function getSelectionKey(span) {
+        const row = span.closest('mat-row, .mat-row, tr');
+        const cell = span.closest('mat-cell, .mat-cell, td');
+        
+        let rowId = '';
+        if (row) {
+          const firstCell = row.querySelector('mat-cell, .mat-cell, td');
+          rowId = firstCell ? firstCell.textContent.trim().substring(0, 50) : '';
+        }
+        
+        const cellClass = cell ? Array.from(cell.classList).filter(c => c.startsWith('mat-column-')).join(',') : '';
+        const val = span.dataset.val || '';
+        const grp = span.dataset.grp || '';
+        
+        return `${rowId}||${cellClass}||${val}||${grp}`;
+      }
+
+      function saveSelection(span, neg) {
+        const key = getSelectionKey(span);
+        selectionMemory.set(key, { val: span.dataset.val, neg: !!neg });
+      }
+
+      function removeSelection(span) {
+        const key = getSelectionKey(span);
+        selectionMemory.delete(key);
+      }
+
+      function reapplySelections() {
+        document.querySelectorAll('.lgt-num').forEach(span => {
+          const key = getSelectionKey(span);
+          if (selectionMemory.has(key)) {
+            const mem = selectionMemory.get(key);
+            span.classList.add('lgt-sel');
+            if (mem.neg) span.classList.add('lgt-neg');
+          }
+        });
+      }
+
+      function clearAllSelections() {
+        selectionMemory.clear();
+        document.querySelectorAll('.lgt-num.lgt-sel').forEach(s => {
+          s.classList.remove('lgt-sel', 'lgt-neg');
+        });
+      }
+
+      function update(skipAnimation = false) {
         const sels = [...document.querySelectorAll('.lgt-num.lgt-sel')];
         let sum = 0;
         let neg = 0;
@@ -274,13 +322,17 @@
           }
         });
 
+        const previousSum = lastSum;
         lastSum = sum;
         curEl.textContent = sum < 0 ? '−Rp' : 'Rp';
         totalNumEl.textContent = fmt(sum);
 
-        totalEl.classList.remove('lgt-pop');
-        void totalEl.offsetWidth;
-        totalEl.classList.add('lgt-pop');
+        // ✅ FIX v1.0.8: Animasi pop CUMA kalau total beneran berubah (anti-blink)
+        if (!skipAnimation && previousSum !== sum) {
+          totalEl.classList.remove('lgt-pop');
+          void totalEl.offsetWidth;
+          totalEl.classList.add('lgt-pop');
+        }
 
         countEl.textContent = sels.length;
         negCountEl.hidden = neg === 0;
@@ -322,31 +374,41 @@
             const row = span.closest('mat-row, .mat-row, tr');
             if (row) {
               row.querySelectorAll('.lgt-num.lgt-sel[data-grp="' + (grp === 'T' ? 'R' : 'T') + '"]')
-                .forEach((s) => s.classList.remove('lgt-sel', 'lgt-neg'));
+                .forEach((s) => {
+                  s.classList.remove('lgt-sel', 'lgt-neg');
+                  removeSelection(s);
+                });
             }
           }
           span.classList.add('lgt-sel');
           span.classList.remove('lgt-neg');
+          saveSelection(span, false);
         } else if (!isNeg) {
           span.classList.add('lgt-neg');
+          saveSelection(span, true);
         } else {
           span.classList.remove('lgt-sel', 'lgt-neg');
+          removeSelection(span);
         }
 
         update();
       }, true);
 
       panel.querySelector('#lgt-all').addEventListener('click', () => {
-        document.querySelectorAll('.lgt-num.lgt-sel[data-grp="R"]').forEach((s) => s.classList.remove('lgt-sel', 'lgt-neg'));
+        document.querySelectorAll('.lgt-num.lgt-sel[data-grp="R"]').forEach((s) => {
+          s.classList.remove('lgt-sel', 'lgt-neg');
+          removeSelection(s);
+        });
         document.querySelectorAll('.lgt-num[data-grp="T"]').forEach((s) => {
           s.classList.add('lgt-sel');
           s.classList.remove('lgt-neg');
+          saveSelection(s, false);
         });
         update();
       });
 
       panel.querySelector('#lgt-reset').addEventListener('click', () => {
-        document.querySelectorAll('.lgt-num.lgt-sel').forEach((s) => s.classList.remove('lgt-sel', 'lgt-neg'));
+        clearAllSelections();
         update();
       });
 
@@ -436,47 +498,55 @@
 
         if (!hits.length) return;
 
+        const wasMutating = selfMutating;
         selfMutating = true;
 
-        const frag = document.createDocumentFragment();
-        let last = 0;
+        try {
+          const frag = document.createDocumentFragment();
+          let last = 0;
 
-        for (const h of hits) {
-          if (h.i > last) frag.appendChild(document.createTextNode(text.slice(last, h.i)));
+          for (const h of hits) {
+            if (h.i > last) frag.appendChild(document.createTextNode(text.slice(last, h.i)));
 
-          const span = document.createElement('span');
-          span.className = 'lgt-num';
-          span.dataset.grp = grp;
-          span.dataset.val = String(parseNum(h.v));
-          span.textContent = h.v;
-          span.title = 'Klik: + • klik lagi: − • klik lagi: lepas';
-          frag.appendChild(span);
+            const span = document.createElement('span');
+            span.className = 'lgt-num';
+            span.dataset.grp = grp;
+            span.dataset.val = String(parseNum(h.v));
+            span.textContent = h.v;
+            span.title = 'Klik: + • klik lagi: − • klik lagi: lepas';
+            frag.appendChild(span);
 
-          last = h.i + h.v.length;
+            last = h.i + h.v.length;
+          }
+
+          if (last < text.length) frag.appendChild(document.createTextNode(text.slice(last)));
+          parent.replaceChild(frag, node);
+        } finally {
+          selfMutating = wasMutating;
         }
-
-        if (last < text.length) frag.appendChild(document.createTextNode(text.slice(last)));
-        parent.replaceChild(frag, node);
-
-        selfMutating = false;
       }
 
       let processing = false;
+      let lastProcessTime = 0;
 
       function scan(root) {
-        const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
-          acceptNode(n) {
-            const p = n.parentNode;
-            if (!p || !p.closest) return NodeFilter.FILTER_REJECT;
-            if (p.closest(SKIP)) return NodeFilter.FILTER_REJECT;
-            if (!p.closest(TABLE_ZONE)) return NodeFilter.FILTER_REJECT;
-            return NodeFilter.FILTER_ACCEPT;
-          }
+        const tables = root.querySelectorAll(TABLE_ZONE);
+        const list = [];
+
+        tables.forEach((table) => {
+          const walker = document.createTreeWalker(table, NodeFilter.SHOW_TEXT, {
+            acceptNode(n) {
+              const p = n.parentNode;
+              if (!p || !p.closest) return NodeFilter.FILTER_REJECT;
+              if (p.closest(SKIP)) return NodeFilter.FILTER_REJECT;
+              return NodeFilter.FILTER_ACCEPT;
+            }
+          });
+
+          let n;
+          while ((n = walker.nextNode())) list.push(n);
         });
 
-        const list = [];
-        let n;
-        while ((n = walker.nextNode())) list.push(n);
         list.forEach(processTextNode);
       }
 
@@ -484,11 +554,20 @@
         if (processing) return;
         if (!isAllowedPage()) return;
 
+        const now = Date.now();
+        if (now - lastProcessTime < 500) return;
+        lastProcessTime = now;
+
         processing = true;
+        obs.disconnect();
+
         try {
           scan(document.body);
-          update();
+          // ✅ FIX v1.0.8: Setelah scan bikin span baru, re-apply seleksi dari memory
+          reapplySelections();
+          update(true); // skipAnimation=true pas re-render (biar gak blink)
         } finally {
+          obs.observe(document.body, { childList: true, subtree: true, characterData: true });
           processing = false;
         }
       }
@@ -518,7 +597,7 @@
         if (!relevant) return;
 
         clearTimeout(obsTimer);
-        obsTimer = setTimeout(processAll, 250);
+        obsTimer = setTimeout(processAll, 400);
       });
 
       obs.observe(document.body, { childList: true, subtree: true, characterData: true });
@@ -561,7 +640,6 @@
         applyPageState(true);
       }
 
-      // Fix 2: Ekspos fungsi onNav agar dapat dipicu oleh Outer Router untuk menghilangkan lag 800ms
       window.__lgtTriggerNav = onNav;
 
       addEventListener('popstate', onNav);
@@ -2241,7 +2319,6 @@ Lanjutkan?`)) return;
         }
       }
 
-      // Fix 1: Ekspos fungsi untuk memaksa tutup panel Scanner
       window.__lgCloseScannerPanel = () => {
         if (panelVisible) togglePanel();
       };
@@ -2266,7 +2343,7 @@ Lanjutkan?`)) return;
           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;padding-bottom:12px;border-bottom:2px solid #e2e8f0;">
             <div>
               <div style="font-size:18px;font-weight:800;color:#1e293b;">📦 LiaGold Scanner</div>
-              <div style="font-size:11px;color:#64748b;margin-top:2px;">Stock Opname · Multiplayer + Merge Solo <b style="color:#16a34a;">v25</b></div>
+              <div style="font-size:11px;color:#64748b;margin-top:2px;">Stock Opname · Multiplayer + Merge Solo <b style="color:#16a34a;">v26</b></div>
             </div>
             <button id="lg-close" style="background:#f1f5f9;border:1px solid #e2e8f0;color:#64748b;border-radius:6px;padding:6px 12px;cursor:pointer;font-size:14px;">✕</button>
           </div>
@@ -2502,14 +2579,11 @@ Lanjutkan?`)) return;
     lastHref = location.href;
     applyRouteClass();
 
-    // Bug 4 Fix: Close image overlay
     const ov = document.getElementById('lg-img-overlay');
     if (ov) ov.remove();
 
-    // Fix 1: Paksa tutup panel Scanner kalau pindah halaman
     if (window.__lgCloseScannerPanel) window.__lgCloseScannerPanel();
 
-    // Fix 2: Pancing Totalizer agar langsung update tanpa nunggu interval 800ms
     if (window.__lgtTriggerNav) window.__lgtTriggerNav();
 
     setTimeout(bootByRoute, 150);
