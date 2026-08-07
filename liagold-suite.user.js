@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LiaGold Suite — Totalizer + Scanner (Unified)
 // @namespace    liagold.suite.unified
-// @version      1.0.12
+// @version      1.0.13
 // @description  Gabungan LiaGold Totalizer + LiaGold Scanner dengan session TTL 12 jam + data auto-purge
 // @match        https://liagold.cuan.co/*
 // @match        http://liagold.cuan.co/*
