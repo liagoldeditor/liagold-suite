@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         LiaGold Suite — Totalizer + Scanner (Unified)
 // @namespace    liagold.suite.unified
-// @version      1.0.10
-// @description  Gabungan LiaGold Totalizer + LiaGold Scanner dengan full history sync + filter kartu status
+// @version      1.0.11
+// @description  Gabungan LiaGold Totalizer + LiaGold Scanner dengan full history sync + batch auto-fill + stop button
 // @match        https://liagold.cuan.co/*
 // @match        http://liagold.cuan.co/*
 // @run-at       document-idle
@@ -717,7 +717,7 @@
         return id;
       })();
 
-      let cloudHistory = {}; // ✅ v1.0.10: Ganti cloudScans dengan cloudHistory
+      let cloudHistory = {};
       let participants = {};
       let dupeCount = 0;
       let es = null;
@@ -727,6 +727,7 @@
       let isDeletingSession = false;
       let formQueue = [];
       let isProcessingForm = false;
+      let isStoppingForm = false; // ✅ v1.0.11: Stop button
       let formFilledCodes = new Set();
       let formRetryCount = 0;
       let formRetryTimer = null;
@@ -744,6 +745,10 @@
       let initialized = false;
       let filterBtnBound = false;
 
+      // ✅ v1.0.11: Adjustable batch settings
+      let batchSize = parseInt(localStorage.getItem('lg_batchSize') || '25');
+      let batchDelay = parseInt(localStorage.getItem('lg_batchDelay') || '1000');
+
       const sleep = ms => new Promise(r => setTimeout(r, ms));
       const isMulti = () => !!sessionId;
 
@@ -751,7 +756,6 @@
         return String(str).replace(/[.#$\[\]\/]/g, '_');
       }
 
-      // ✅ v1.0.10: Generate unique key per scan event
       function generateHistoryKey(codeProduct, timestamp) {
         const cp = String(codeProduct || '').toLowerCase();
         const ts = timestamp || new Date().toISOString();
@@ -869,6 +873,34 @@
         }
       }
 
+      // ✅ v1.0.11: Filter berdasarkan baki aktif
+      function shouldQueueToForm(entry) {
+        if (!entry || !entry.codeProduct) return false;
+        
+        // Hanya MASUK yang masuk form (produk dari baki aktif)
+        if (entry.status !== 'MASUK') return false;
+        
+        // Cek produk ada di baki aktif
+        const product = productMap.get(String(entry.codeProduct).toLowerCase());
+        if (product) {
+          // Baki aktif harus spesifik (bukan 'all')
+          if (selectedTray === 'all') return false;
+          
+          // Produk harus berada di baki aktif
+          return String(product.trayId) === selectedTray;
+        }
+        
+        // Jika produk tidak ada di productMap, cek dari entry.tray
+        if (entry.tray && entry.tray !== '-') {
+          const trayInfo = trayList.find(t => t.trayCode === entry.tray);
+          if (trayInfo && selectedTray !== 'all') {
+            return String(trayInfo.trayId) === selectedTray;
+          }
+        }
+        
+        return false;
+      }
+
       function queueFormInput(code) {
         const lc = String(code).toLowerCase();
         if (formFilledCodes.has(lc)) return;
@@ -878,6 +910,7 @@
         processFormQueue();
       }
 
+      // ✅ v1.0.11: Batch processing dengan stop button
       async function processFormQueue() {
         if (isProcessingForm) return;
         if (!formQueue.length) return;
@@ -902,11 +935,31 @@
         }
 
         isProcessingForm = true;
+        isStoppingForm = false;
         formRetryCount = 0;
         let processed = 0;
+        let batchCount = 0;
+        const totalItems = formQueue.length;
 
         try {
           while (formQueue.length) {
+            if (isStoppingForm) {
+              updateStatus(`⏹ Dihentikan. ${formQueue.length} kode tersisa di queue.`);
+              break;
+            }
+            
+            // ✅ v1.0.11: Check batch limit
+            if (batchCount >= batchSize && formQueue.length > 0) {
+              updateStatus(`⏸️ Jeda batch: ${processed}/${totalItems} diproses. Menunggu ${batchDelay}ms...`);
+              await sleep(batchDelay);
+              batchCount = 0;
+              
+              if (isStoppingForm) {
+                updateStatus(`⏹ Dihentikan setelah jeda batch.`);
+                break;
+              }
+            }
+
             const code = formQueue.shift();
             const lc = String(code).toLowerCase();
 
@@ -947,13 +1000,19 @@
 
             formFilledCodes.add(lc);
             processed++;
-            await sleep(120);
+            batchCount++;
+            
+            // ✅ v1.0.11: Small delay between items to prevent freezing
+            await sleep(50);
           }
         } finally {
           isProcessingForm = false;
+          isStoppingForm = false;
         }
 
-        if (processed > 0) updateStatus(`✅ ${processed} kode berhasil diinput ke form.`);
+        if (processed > 0 && !isStoppingForm) {
+          updateStatus(`✅ ${processed} kode berhasil diinput ke form.`);
+        }
       }
 
       async function fbPut(path, data) {
@@ -964,7 +1023,6 @@
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
       }
 
-      // ✅ v1.0.10: Push SEMUA status ke /history/ dengan unique key
       async function pushScanToCloud(entry, retries = 3) {
         if (!isMulti()) return;
 
@@ -988,7 +1046,6 @@
         }
       }
 
-      // ✅ v1.0.10: Retry push ke /history/
       function scheduleRetryPush() {
         if (retryTimer) return;
 
@@ -1020,7 +1077,6 @@
         }, 5000);
       }
 
-      // ✅ v1.0.10: Migrate solo scans ke /history/ (semua status)
       async function migrateSoloScansToSession() {
         if (!scanLog.length) return;
 
@@ -1035,12 +1091,10 @@
         let existingKeys = new Set();
 
         try {
-          // ✅ v1.0.10: Baca dari /history/ bukan /scans/
           const res = await fetch(`${FIREBASE}/opname/${sessionId}/history.json`);
           const data = await res.json();
           if (data) existingKeys = new Set(Object.keys(data));
           
-          // ✅ v1.0.10: Backward compat - juga cek /scans/ lama
           const res2 = await fetch(`${FIREBASE}/opname/${sessionId}/scans.json`);
           const data2 = await res2.json();
           if (data2) {
@@ -1319,7 +1373,6 @@ Kamu otomatis kembali ke MODE SOLO.
 Data scan di device ini tetap tersimpan lokal.`);
       }
 
-      // ✅ v1.0.10: Listen untuk /history/ events
       function listenSession() {
         if (es) es.close();
 
@@ -1340,10 +1393,8 @@ Data scan di device ini tetap tersimpan lokal.`);
               return;
             }
 
-            // ✅ v1.0.10: Baca dari /history/ dan backward compat /scans/
             cloudHistory = data.history || {};
             
-            // Backward compat: merge data lama dari /scans/
             if (data.scans) {
               Object.entries(data.scans).forEach(([k, v]) => {
                 if (!v || !v.codeProduct) return;
@@ -1362,7 +1413,6 @@ Data scan di device ini tetap tersimpan lokal.`);
             return;
           }
 
-          // ✅ v1.0.10: Listen untuk /history/ events
           if (path === '/history') {
             if (data === null) {
               cloudHistory = {};
@@ -1384,7 +1434,6 @@ Data scan di device ini tetap tersimpan lokal.`);
             return;
           }
 
-          // ✅ v1.0.10: Backward compat untuk /scans/ lama
           if (path === '/scans' || path.startsWith('/scans/')) {
             const scansData = path === '/scans' ? data : null;
             
@@ -1452,7 +1501,6 @@ Data scan di device ini tetap tersimpan lokal.`);
               if (k === 'peserta') participants = v || {};
               if (k === 'dupes') dupeCount = v ? Object.keys(v).length : 0;
               
-              // Backward compat
               if (k === 'scans' && v && typeof v === 'object') {
                 Object.entries(v).forEach(([sk, sv]) => {
                   if (!sv || !sv.codeProduct) return;
@@ -1492,7 +1540,6 @@ Data scan di device ini tetap tersimpan lokal.`);
             return;
           }
 
-          // Backward compat untuk /scans/
           if (path === '/scans' || path.startsWith('/scans/')) {
             const scansData = path === '/scans' ? data : null;
             
@@ -1568,7 +1615,6 @@ Data scan di device ini tetap tersimpan lokal.`);
                 return;
               }
 
-              // ✅ v1.0.10: Merge /history/ dan /scans/
               cloudHistory = data.history || {};
               
               if (data.scans) {
@@ -1602,7 +1648,7 @@ Data scan di device ini tetap tersimpan lokal.`);
         };
       }
 
-      // ✅ v1.0.10: onCloudUpdate baca dari cloudHistory
+      // ✅ v1.0.11: Filter auto-fill berdasarkan baki aktif
       function onCloudUpdate() {
         const newScannedCodes = new Set();
         const historyEntries = [];
@@ -1632,7 +1678,6 @@ Data scan di device ini tetap tersimpan lokal.`);
         scannedCodes = newScannedCodes;
 
         pendingLocalScans.forEach(rawCode => {
-          // Find and remove from pending if exists in cloud
           let found = false;
           Object.values(cloudHistory || {}).forEach(v => {
             if (v && v.codeProduct && String(v.codeProduct).toLowerCase() === rawCode) {
@@ -1654,12 +1699,17 @@ Data scan di device ini tetap tersimpan lokal.`);
           }
         });
 
+        // ✅ v1.0.11: Hanya queue ke form jika produk dari baki aktif
         if (initialCloudSyncDone && autoFillForm && newKeys.length) {
           newKeys.forEach(k => {
             const scan = cloudHistory[k];
             if (!scan || !scan.codeProduct) return;
             if (scan.by === myName) return;
-            if (scan.status === 'MASUK' || scan.status === 'SALAH BAKI') queueFormInput(scan.codeProduct);
+            
+            // ✅ v1.0.11: Filter berdasarkan baki aktif
+            if (!shouldQueueToForm(scan)) return;
+            
+            queueFormInput(scan.codeProduct);
           });
         }
 
@@ -2081,7 +2131,6 @@ Data scan di device ini tetap tersimpan lokal.`);
         if (input) input.focus();
       }
 
-      // ✅ v1.0.10: Push SEMUA status ke cloud
       async function doScanInternal(code) {
         if (!traySelected) {
           showResult('⚠️ Pilih baki spesifik terlebih dahulu sebelum scan!', ST.TIDAK_ADA, '');
@@ -2118,7 +2167,6 @@ Data scan di device ini tetap tersimpan lokal.`);
             st = ST.SUDAH;
             const sKey = sanitizeKey(cpL);
             
-            // ✅ v1.0.10: Cari siapa yang scan duluan dari cloudHistory
             let byWhom = '';
             if (isMulti()) {
               const foundEntry = Object.values(cloudHistory).find(v => 
@@ -2176,7 +2224,6 @@ Data scan di device ini tetap tersimpan lokal.`);
           by: myName || '',
         };
 
-        // ✅ v1.0.10: Selalu push SEMUA status ke cloud
         if (isMulti()) {
           scanLog.unshift(logEntry);
           if (scanLog.length > MAX_SCAN_LOG) scanLog = scanLog.slice(0, MAX_SCAN_LOG);
@@ -2189,7 +2236,6 @@ Data scan di device ini tetap tersimpan lokal.`);
           debouncedPersist();
           scheduleRender();
 
-          // ✅ v1.0.10: Push ke /history/ untuk SEMUA status
           await pushScanToCloud({
             by: myName,
             time: now.toISOString(),
@@ -2213,7 +2259,10 @@ Data scan di device ini tetap tersimpan lokal.`);
         showResult(msg, st, imgUrl);
         beep(st === ST.MASUK ? 880 : st === ST.SUDAH ? 440 : 220);
 
-        if (autoFillForm && st === ST.MASUK) queueFormInput(finalCodeProduct);
+        // ✅ v1.0.11: Hanya auto-queue ke form jika produk dari baki aktif
+        if (autoFillForm && st === ST.MASUK && shouldQueueToForm(logEntry)) {
+          queueFormInput(finalCodeProduct);
+        }
       }
 
       function beep(freq) {
@@ -2491,7 +2540,6 @@ Data scan di device ini tetap tersimpan lokal.`);
         if (isMulti()) {
           if (!confirm('Reset SEMUA progress sesi (untuk semua peserta)?')) return;
 
-          // ✅ v1.0.10: Hapus /history/ dan /scans/ dan /dupes/
           fetch(`${FIREBASE}/opname/${sessionId}/history.json`, { method: 'DELETE' });
           fetch(`${FIREBASE}/opname/${sessionId}/scans.json`, { method: 'DELETE' });
           fetch(`${FIREBASE}/opname/${sessionId}/dupes.json`, { method: 'DELETE' });
@@ -2525,7 +2573,10 @@ Data scan di device ini tetap tersimpan lokal.`);
       }
 
       async function sendToForm() {
-        if (isProcessingForm) return;
+        if (isProcessingForm) {
+          updateStatus('⚠️ Proses sedang berjalan. Klik "⏹ Stop" untuk menghentikan.');
+          return;
+        }
 
         const input = getFormInput();
         if (!input) {
@@ -2556,7 +2607,39 @@ Data scan di device ini tetap tersimpan lokal.`);
 Lanjutkan?`)) return;
 
         missing.forEach(code => queueFormInput(code));
-        updateStatus(`📤 Mengirim ${missing.length} barang ke form…`);
+        updateStatus(`📤 Mengirim ${missing.length} barang ke form (batch: ${batchSize}, delay: ${batchDelay}ms)...`);
+      }
+
+      // ✅ v1.0.11: Stop button handler
+      function stopFormQueue() {
+        if (isProcessingForm) {
+          isStoppingForm = true;
+          updateStatus('⏹ Menghentikan proses auto-fill...');
+        } else {
+          updateStatus('⚠️ Tidak ada proses yang sedang berjalan.');
+        }
+      }
+
+      // ✅ v1.0.11: Update batch settings
+      function updateBatchSettings() {
+        const sizeInput = document.getElementById('lg-batch-size');
+        const delayInput = document.getElementById('lg-batch-delay');
+        
+        if (sizeInput) {
+          const newSize = parseInt(sizeInput.value) || 25;
+          batchSize = Math.max(1, Math.min(100, newSize));
+          sizeInput.value = batchSize;
+          localStorage.setItem('lg_batchSize', batchSize);
+        }
+        
+        if (delayInput) {
+          const newDelay = parseInt(delayInput.value) || 1000;
+          batchDelay = Math.max(100, Math.min(10000, newDelay));
+          delayInput.value = batchDelay;
+          localStorage.setItem('lg_batchDelay', batchDelay);
+        }
+        
+        updateStatus(`⚙️ Batch settings: ${batchSize} barang/batch, ${batchDelay}ms delay`);
       }
 
       function togglePanel() {
@@ -2601,7 +2684,7 @@ Lanjutkan?`)) return;
           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;padding-bottom:12px;border-bottom:2px solid #e2e8f0;">
             <div>
               <div style="font-size:18px;font-weight:800;color:#1e293b;">📦 LiaGold Scanner</div>
-              <div style="font-size:11px;color:#64748b;margin-top:2px;">Stock Opname · Multiplayer + Merge Solo <b style="color:#16a34a;">v28</b></div>
+              <div style="font-size:11px;color:#64748b;margin-top:2px;">Stock Opname · Multiplayer + Merge Solo <b style="color:#16a34a;">v29</b></div>
             </div>
             <button id="lg-close" style="background:#f1f5f9;border:1px solid #e2e8f0;color:#64748b;border-radius:6px;padding:6px 12px;cursor:pointer;font-size:14px;">✕</button>
           </div>
@@ -2646,7 +2729,7 @@ Lanjutkan?`)) return;
             <div style="margin-top:10px;">
               <label style="display:flex;align-items:center;gap:8px;font-size:11px;color:#64748b;cursor:pointer;user-select:none;">
                 <input type="checkbox" id="lg-autofill" checked style="accent-color:#2563eb;width:14px;height:14px;" />
-                Auto-isi & sinkron form <span style="color:#94a3b8;">(scan kamu + scan pemain lain otomatis masuk form)</span>
+                Auto-isi & sinkron form <span style="color:#94a3b8;">(hanya produk dari baki aktif)</span>
               </label>
             </div>
             <div style="margin-top:8px;font-size:10px;color:#94a3b8;line-height:1.6;">
@@ -2656,10 +2739,26 @@ Lanjutkan?`)) return;
 
           <div id="lg-result" style="display:none;padding:12px 16px;border-radius:8px;font-size:13px;margin-bottom:12px;line-height:1.6;"></div>
 
-          <div style="display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap;">
-            <button id="lg-send-form-btn" style="padding:8px 16px;background:#2563eb;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:12px;font-weight:600;">📤 Kirim ke Form</button>
-            <button id="lg-export-btn" style="padding:8px 16px;background:#16a34a;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:12px;font-weight:600;">📥 Export CSV</button>
-            <button id="lg-reset-btn" style="padding:8px 16px;background:#dc2626;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:12px;font-weight:600;">🔄 Reset Progress</button>
+          <!-- ✅ v1.0.11: Batch settings + Stop button -->
+          <div style="background:#fff;border:1px solid #e2e8f0;border-radius:8px;padding:14px;margin-bottom:12px;">
+            <div style="font-size:10px;font-weight:700;color:#475569;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:10px;">⚙️ Auto-Fill Settings</div>
+            <div style="display:flex;gap:10px;align-items:center;margin-bottom:10px;">
+              <label style="font-size:11px;color:#64748b;white-space:nowrap;">Batch:</label>
+              <input id="lg-batch-size" type="number" min="1" max="100" value="${batchSize}"
+                style="width:60px;padding:5px 8px;border-radius:4px;border:1px solid #cbd5e1;font-size:11px;" />
+              <span style="font-size:11px;color:#94a3b8;">barang</span>
+              <label style="font-size:11px;color:#64748b;white-space:nowrap;margin-left:10px;">Delay:</label>
+              <input id="lg-batch-delay" type="number" min="100" max="10000" step="100" value="${batchDelay}"
+                style="width:70px;padding:5px 8px;border-radius:4px;border:1px solid #cbd5e1;font-size:11px;" />
+              <span style="font-size:11px;color:#94a3b8;">ms</span>
+              <button id="lg-apply-batch-btn" style="padding:5px 12px;background:#16a34a;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:10px;font-weight:600;margin-left:auto;">✓ Apply</button>
+            </div>
+            <div style="display:flex;gap:6px;flex-wrap:wrap;">
+              <button id="lg-send-form-btn" style="padding:8px 16px;background:#2563eb;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:12px;font-weight:600;">📤 Kirim ke Form</button>
+              <button id="lg-stop-form-btn" style="padding:8px 16px;background:#dc2626;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:12px;font-weight:600;">⏹ Stop</button>
+              <button id="lg-export-btn" style="padding:8px 16px;background:#16a34a;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:12px;font-weight:600;">📥 Export CSV</button>
+              <button id="lg-reset-btn" style="padding:8px 16px;background:#dc2626;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:12px;font-weight:600;">🔄 Reset Progress</button>
+            </div>
           </div>
 
           <div style="background:#fff;border:1px solid #e2e8f0;border-radius:8px;margin-bottom:14px;overflow:hidden;">
@@ -2751,6 +2850,10 @@ Lanjutkan?`)) return;
         document.getElementById('lg-reset-btn').addEventListener('click', resetProgress);
         document.getElementById('lg-sync-btn').addEventListener('click', syncTrayList);
         document.getElementById('lg-send-form-btn').addEventListener('click', sendToForm);
+        
+        // ✅ v1.0.11: Stop button
+        document.getElementById('lg-stop-form-btn').addEventListener('click', stopFormQueue);
+        document.getElementById('lg-apply-batch-btn').addEventListener('click', updateBatchSettings);
 
         document.getElementById('lg-autofill').addEventListener('change', e => {
           autoFillForm = e.target.checked;
