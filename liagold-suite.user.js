@@ -1,8 +1,20 @@
+Masalahnya ada pada **Regex URL Pathname** yang terlalu ketat (`^\/stock-opname\/?$`). Regex lama hanya mendeteksi URL yang **persis** `/stock-opname` tanpa prefix (seperti `/admin/...` atau `/app/...`) dan tanpa query string/parameter.
+
+Akibatnya, class `.lgs-scanner-on` (untuk Scanner) dan `.lgt-page-on` (untuk Totalizer) tidak pernah ditambahkan ke elemen `<html>`, sehingga CSS bawaan script (`display: none !important`) otomatis menyembunyikan floating box (`#lg-fab` dan `#lgt-fab`).
+
+Berikut adalah perbaikan:
+1. **Regex diperlonggar** menggunakan pola `/\/nama-halaman(?:\/|\?|$)/` agar bisa mendeteksi path di dalam subfolder maupun yang memiliki query string.
+2. **Menambahkan `Tokenizer`** ke dalam daftar halaman Totalizer.
+3. Versi dinaikkan ke **1.0.14**.
+
+### Kode Lengkap yang Sudah Diperbaiki
+
+```javascript
 // ==UserScript==
 // @name         LiaGold Suite — Totalizer + Scanner (Unified)
 // @namespace    liagold.suite.unified
-// @version      1.0.13
-// @description  Gabungan LiaGold Totalizer + LiaGold Scanner dengan session TTL 12 jam + data auto-purge
+// @version      1.0.14
+// @description  Gabungan LiaGold Totalizer + LiaGold Scanner dengan session TTL 12 jam + data auto-purge + FIX Regex URL
 // @match        https://liagold.cuan.co/*
 // @match        http://liagold.cuan.co/*
 // @run-at       document-idle
@@ -17,21 +29,22 @@
   if (window.__lgSuite) return;
   window.__lgSuite = true;
 
+  // ✅ FIX: Regex diperlonggar agar bisa mendeteksi URL dengan prefix folder atau query string
   const TOTAL_PAGES = [
-    /^\/sales\/?$/,
-    /^\/sales-cancel\/?$/,
-    /^\/purchasing\/?$/,
-    /^\/purchasing-non-invoice\/?$/,
-    /^\/money-balance\/?$/,
-    /^\/repair\/?$/,
-    /^\/order\/?$/,
+    /\/sales(?:\/|\?|$)/,
+    /\/sales-cancel(?:\/|\?|$)/,
+    /\/purchasing(?:\/|\?|$)/,
+    /\/purchasing-non-invoice(?:\/|\?|$)/,
+    /\/money-balance(?:\/|\?|$)/,
+    /\/repair(?:\/|\?|$)/,
+    /\/order(?:\/|\?|$)/,
+    /\/tokenizer(?:\/|\?|$)/, // ✅ Tambahan halaman Tokenizer
   ];
 
   const SCANNER_PAGES = [
-    /^\/stock-opname\/?$/,
-    /^\/stock-opname\/create\/?$/,
-    /^\/product-daily\/?$/,
-    /^\/product\/?$/,
+    /\/stock-opname(?:\/|\?|$)/,
+    /\/product-daily(?:\/|\?|$)/,
+    /\/product(?:\/|\?|$)/,
   ];
 
   const isTotalPage = () => TOTAL_PAGES.some((re) => re.test(location.pathname));
@@ -64,14 +77,16 @@
       if (window.__lgTotalizer) return;
       window.__lgTotalizer = true;
 
+      // ✅ FIX: Regex disamakan dengan di luar agar sinkron
       const PAGES = [
-        { re: /^\/sales\/?$/,                   label: 'Sales' },
-        { re: /^\/sales-cancel\/?$/,            label: 'Sales Cancel' },
-        { re: /^\/purchasing\/?$/,              label: 'Purchasing' },
-        { re: /^\/purchasing-non-invoice\/?$/,  label: 'Purchasing Non-Invoice' },
-        { re: /^\/money-balance\/?$/,           label: 'Money Balance' },
-        { re: /^\/repair\/?$/,                  label: 'Repair' },
-        { re: /^\/order\/?$/,                   label: 'Order' },
+        { re: /\/sales(?:\/|\?|$)/,                   label: 'Sales' },
+        { re: /\/sales-cancel(?:\/|\?|$)/,            label: 'Sales Cancel' },
+        { re: /\/purchasing(?:\/|\?|$)/,              label: 'Purchasing' },
+        { re: /\/purchasing-non-invoice(?:\/|\?|$)/,  label: 'Purchasing Non-Invoice' },
+        { re: /\/money-balance(?:\/|\?|$)/,           label: 'Money Balance' },
+        { re: /\/repair(?:\/|\?|$)/,                  label: 'Repair' },
+        { re: /\/order(?:\/|\?|$)/,                   label: 'Order' },
+        { re: /\/tokenizer(?:\/|\?|$)/,               label: 'Tokenizer' },
       ];
 
       function detectPage() {
@@ -667,9 +682,8 @@
       const MAX_SCAN_LOG = 2000;
       const MAX_FORM_RETRY = 20;
 
-      // ✅ v1.0.12: TTL constants
-      const DATA_TTL_MS = 12 * 60 * 60 * 1000; // 12 jam untuk data scan
-      const SESSION_TTL_MS = 12 * 60 * 60 * 1000; // 12 jam untuk sesi
+      const DATA_TTL_MS = 12 * 60 * 60 * 1000;
+      const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
 
       const ST = {
         MASUK:      { label: 'MASUK',             color: '#16a34a', bg: '#f0fdf4', bd: '#bbf7d0' },
@@ -749,11 +763,9 @@
       let initialized = false;
       let filterBtnBound = false;
 
-      // ✅ v1.0.11: Adjustable batch settings
       let batchSize = parseInt(localStorage.getItem('lg_batchSize') || '25');
       let batchDelay = parseInt(localStorage.getItem('lg_batchDelay') || '1000');
 
-      // ✅ v1.0.12: Session expiry tracking
       let sessionCreatedAt = null;
       let purgeIntervalId = null;
 
@@ -771,7 +783,6 @@
         return sanitizeKey(cp + '_' + ts + '_' + rand);
       }
 
-      // ✅ v1.0.12: Check if entry is expired (>12 jam)
       function isEntryExpired(entry) {
         if (!entry || !entry.time) return false;
         try {
@@ -783,7 +794,6 @@
         }
       }
 
-      // ✅ v1.0.12: Check if session is expired (>12 jam)
       function isSessionExpired(createdAt) {
         if (!createdAt) return false;
         try {
@@ -795,7 +805,6 @@
         }
       }
 
-      // ✅ v1.0.12: Purge expired entries from cloud
       async function purgeExpiredEntries() {
         if (!isMulti() || isDeletingSession) return;
 
@@ -832,7 +841,6 @@
         }
       }
 
-      // ✅ v1.0.12: Check and handle session expiry
       async function checkSessionExpiry() {
         if (!sessionId || isDeletingSession) return;
 
@@ -852,12 +860,10 @@
             return;
           }
 
-          // Update countdown display
           updateSessionCountdown();
         } catch (e) {}
       }
 
-      // ✅ v1.0.12: Silent delete session (auto-expiry)
       async function deleteSessionSilent(reason) {
         if (!sessionId || isDeletingSession) return;
 
@@ -889,7 +895,6 @@ Silakan buat sesi baru untuk melanjutkan.`);
         }
       }
 
-      // ✅ v1.0.12: Update session countdown display
       function updateSessionCountdown() {
         const countdownEl = document.getElementById('lg-session-countdown');
         if (!countdownEl) return;
@@ -938,9 +943,7 @@ Silakan buat sesi baru untuk melanjutkan.`);
         allProducts.forEach(p => productMap.set(String(p.codeProduct).toLowerCase(), p));
       }
 
-      // Ganti fungsi injectStyles() dengan ini:
 function injectStyles() {
-  // ✅ v1.0.12 FIX: Hapus style lama jika ada, lalu inject ulang
   const existingStyle = document.getElementById('lg-styles');
   if (existingStyle) existingStyle.remove();
   
@@ -954,7 +957,6 @@ function injectStyles() {
     @keyframes lgPulse { 0%,100%{box-shadow:0 0 0 0 rgba(22,163,74,.5)} 50%{box-shadow:0 0 0 6px rgba(22,163,74,0)} }
     .lg-dot-live { animation: lgPulse 1.6s infinite; }
     
-    /* ✅ v1.0.12 FIX: Hover effects untuk semua tombol */
     #lg-panel button { 
       transition: transform .12s ease, box-shadow .12s ease, filter .12s ease, background .15s ease; 
     }
@@ -973,7 +975,6 @@ function injectStyles() {
     .lg-result-anim { animation: lgPop .18s ease; }
     #lg-fab { transition: transform .2s ease, box-shadow .2s ease !important; }
     
-    /* ✅ v1.0.12 FIX: Stat cards hover - lebih visible */
     .lg-stat-clickable { 
       cursor: pointer !important; 
       user-select: none; 
@@ -995,18 +996,15 @@ function injectStyles() {
       border-color: #2563eb !important;
     }
     
-    /* ✅ v1.0.12 FIX: Tray dropdown hover */
     .lg-tray-opt:hover {
       background: #eff6ff !important;
     }
     
-    /* ✅ v1.0.12 FIX: Scan tabs hover */
     .lg-scan-tab:hover {
       filter: brightness(1.05);
       transform: translateY(-1px);
     }
     
-    /* ✅ v1.0.12 FIX: Image links hover */
     .lg-img-link:hover {
       text-decoration: underline !important;
       opacity: 0.85;
@@ -1355,13 +1353,11 @@ function injectStyles() {
         updateStatus(`✅ ${ok}/${count} scan solo terunggah — progress LANJUT.`);
       }
 
-      // ✅ v1.0.12: Create session without "OPNAME-" prefix
       async function createSession() {
         const nama = document.getElementById('lg-mp-name').value.trim() || 'Anonim';
         myName = nama;
         localStorage.setItem('lg_mp_name', nama);
 
-        // ✅ v1.0.12: Kode 6 karakter tanpa prefix
         const code = Math.random().toString(36).substr(2, 6).toUpperCase();
 
         try {
@@ -1423,7 +1419,6 @@ function injectStyles() {
             return;
           }
 
-          // ✅ v1.0.12: Check if session is expired
           if (meta.dibuat && isSessionExpired(meta.dibuat)) {
             updateStatus('❌ Sesi "' + code + '" sudah EXPIRED (>12 jam).');
             return;
@@ -1543,7 +1538,6 @@ Semua device lain akan OTOMATIS keluar.
         }
       }
 
-      // ✅ v1.0.12: Start periodic purge check
       function startPurgeInterval() {
         stopPurgeInterval();
         
@@ -1552,9 +1546,8 @@ Semua device lain akan OTOMATIS keluar.
             purgeExpiredEntries();
             checkSessionExpiry();
           }
-        }, 5 * 60 * 1000); // Setiap 5 menit
+        }, 5 * 60 * 1000);
 
-        // Also run immediately
         setTimeout(() => {
           if (isMulti() && !isDeletingSession) {
             purgeExpiredEntries();
@@ -1900,7 +1893,6 @@ Data scan di device ini tetap tersimpan lokal.`);
         Object.values(cloudHistory || {}).forEach(v => {
           if (!v || !v.codeProduct) return;
 
-          // ✅ v1.0.12: Skip expired entries
           if (isEntryExpired(v)) return;
 
           historyEntries.push({
@@ -1952,7 +1944,6 @@ Data scan di device ini tetap tersimpan lokal.`);
             if (!scan || !scan.codeProduct) return;
             if (scan.by === myName) return;
             
-            // ✅ v1.0.12: Skip expired entries
             if (isEntryExpired(scan)) return;
             
             if (!shouldQueueToForm(scan)) return;
@@ -2558,7 +2549,6 @@ Data scan di device ini tetap tersimpan lokal.`);
   const el = document.getElementById('lg-stats');
   if (!el) return;
 
-  // ✅ v1.0.12 FIX: Generate HTML dengan class yang benar
   el.innerHTML = cards.map(c => {
     const clickable = !!c.filter;
     const active = c.filter && c.filter === statusFilter;
@@ -2577,7 +2567,6 @@ Data scan di device ini tetap tersimpan lokal.`);
     `;
   }).join('');
 
-  // ✅ v1.0.12 FIX: Attach click handlers
   el.querySelectorAll('.lg-stat-clickable').forEach(card => {
     card.addEventListener('click', () => {
       const filter = card.dataset.filter;
@@ -2938,7 +2927,7 @@ Lanjutkan?`)) return;
           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;padding-bottom:12px;border-bottom:2px solid #e2e8f0;">
             <div>
               <div style="font-size:18px;font-weight:800;color:#1e293b;">📦 LiaGold Scanner</div>
-              <div style="font-size:11px;color:#64748b;margin-top:2px;">Stock Opname · Multiplayer + Merge Solo <b style="color:#16a34a;">v30</b></div>
+              <div style="font-size:11px;color:#64748b;margin-top:2px;">Stock Opname · Multiplayer + Merge Solo <b style="color:#16a34a;">v31</b></div>
             </div>
             <button id="lg-close" style="background:#f1f5f9;border:1px solid #e2e8f0;color:#64748b;border-radius:6px;padding:6px 12px;cursor:pointer;font-size:14px;">✕</button>
           </div>
@@ -3232,3 +3221,4 @@ Lanjutkan?`)) return;
 
   bootByRoute();
 })();
+```
