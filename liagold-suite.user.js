@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         LiaGold Suite — Totalizer + Scanner (Unified)
 // @namespace    liagold.suite.unified
-// @version      1.0.8
-// @description  Gabungan LiaGold Totalizer + LiaGold Scanner dengan selection memory + anti-blink + bug fixes
+// @version      1.0.9
+// @description  Gabungan LiaGold Totalizer + LiaGold Scanner dengan selection memory + anti-blink + filter kartu status
 // @match        https://liagold.cuan.co/*
 // @match        http://liagold.cuan.co/*
 // @run-at       document-idle
@@ -259,7 +259,6 @@
       let prevCount = 0;
       let lastSum = 0;
 
-      // ✅ FIX v1.0.8: Selection Memory - simpan state seleksi biar gak ilang pas Angular re-render
       const selectionMemory = new Map();
 
       function getSelectionKey(span) {
@@ -327,7 +326,6 @@
         curEl.textContent = sum < 0 ? '−Rp' : 'Rp';
         totalNumEl.textContent = fmt(sum);
 
-        // ✅ FIX v1.0.8: Animasi pop CUMA kalau total beneran berubah (anti-blink)
         if (!skipAnimation && previousSum !== sum) {
           totalEl.classList.remove('lgt-pop');
           void totalEl.offsetWidth;
@@ -563,9 +561,8 @@
 
         try {
           scan(document.body);
-          // ✅ FIX v1.0.8: Setelah scan bikin span baru, re-apply seleksi dari memory
           reapplySelections();
-          update(true); // skipAnimation=true pas re-render (biar gak blink)
+          update(true);
         } finally {
           obs.observe(document.body, { childList: true, subtree: true, characterData: true });
           processing = false;
@@ -708,6 +705,7 @@
       let selectedTray = 'all';
       let traySelected = false;
       let scanFilter = 'all';
+      let statusFilter = 'none'; // ✅ v1.0.9: Filter kartu status
       let autoFillForm = true;
       let scanLog = safeParse('lg_scanLog', []);
       let scannedCodes = new Set(scanLog.filter(l => l.status === 'MASUK').map(l => String(l.codeProduct).toLowerCase()));
@@ -744,6 +742,7 @@
       let renderThrottleTimer = null;
       let persistDebounceTimer = null;
       let initialized = false;
+      let filterBtnBound = false;
 
       const sleep = ms => new Promise(r => setTimeout(r, ms));
       const isMulti = () => !!sessionId;
@@ -790,6 +789,10 @@
           .lg-tray-opt { transition: background .12s ease; }
           .lg-result-anim { animation: lgPop .18s ease; }
           #lg-fab { transition: transform .2s ease, box-shadow .2s ease !important; }
+          /* ✅ v1.0.9: Stat card clickable + active */
+          .lg-stat-clickable { cursor: pointer; user-select: none; transition: transform .15s ease, box-shadow .15s ease, outline .15s ease; }
+          .lg-stat-clickable:hover { transform: translateY(-2px); box-shadow: 0 4px 12px rgba(0,0,0,.10); }
+          .lg-stat-clickable.lg-stat-active { outline: 2.5px solid #2563eb !important; outline-offset: 1px; transform: scale(1.04); box-shadow: 0 4px 14px rgba(37,99,235,.30); }
         `;
         document.head.appendChild(s);
       }
@@ -1112,6 +1115,7 @@
           formRetryCount = 0;
           pendingLocalScans = new Set();
           pendingCloudPushes = [];
+          statusFilter = 'none';
 
           await migrateSoloScansToSession();
 
@@ -1160,6 +1164,7 @@
           formRetryCount = 0;
           pendingLocalScans = new Set();
           pendingCloudPushes = [];
+          statusFilter = 'none';
 
           await migrateSoloScansToSession();
 
@@ -1199,6 +1204,7 @@
         pendingLocalScans = new Set();
         pendingCloudPushes = [];
         esFailCount = 0;
+        statusFilter = 'none'; // ✅ v1.0.9
 
         if (retryTimer) {
           clearTimeout(retryTimer);
@@ -1681,6 +1687,7 @@ Data scan di device ini tetap tersimpan lokal.`);
           selectedTray = 'all';
           traySelected = false;
           scanFilter = 'all';
+          statusFilter = 'none';
 
           resetScanTabUI();
           renderTrayDropdown('');
@@ -1799,6 +1806,7 @@ Data scan di device ini tetap tersimpan lokal.`);
       function selectTray(val, label) {
         selectedTray = val;
         traySelected = (val !== 'all');
+        statusFilter = 'none'; // ✅ v1.0.9: Reset filter kartu status
 
         document.getElementById('lg-tray-search').value = label;
         document.getElementById('lg-tray-dropdown').style.display = 'none';
@@ -1848,13 +1856,50 @@ Data scan di device ini tetap tersimpan lokal.`);
         }
       }
 
+      // ✅ v1.0.9: applyFilters dengan dukungan statusFilter
       function applyFilters() {
-        filteredProducts = allProducts.filter(p => {
-          const s = scannedCodes.has(String(p.codeProduct).toLowerCase());
-          return scanFilter === 'all' || (scanFilter === 'scanned' && s) || (scanFilter === 'unscanned' && !s);
-        });
+        const banner = document.getElementById('lg-filter-banner');
+        const bannerText = document.getElementById('lg-filter-banner-text');
+        const clearBtn = document.getElementById('lg-clear-filter-btn');
 
-        renderProducts();
+        if (statusFilter !== 'none') {
+          // Filter dari scanLog berdasarkan status
+          filteredProducts = scanLog.filter(l => l.status === statusFilter);
+
+          renderProductsFromLog();
+
+          if (banner) {
+            banner.style.display = 'flex';
+            if (bannerText) {
+              const statusIcon = {
+                'MASUK': '✅',
+                'SUDAH DISCAN': '⚠️',
+                'SALAH BAKI': '🟠',
+                'TERJUAL / RUSAK': '🟣',
+                'BARCODE TIDAK ADA': '🔴',
+              }[statusFilter] || '🔍';
+              bannerText.innerHTML = `${statusIcon} Filter: <b style="color:#1e40af;">${esc(statusFilter)}</b> — menampilkan <b>${filteredProducts.length}</b> scan`;
+            }
+            if (clearBtn && !filterBtnBound) {
+              filterBtnBound = true;
+              clearBtn.addEventListener('click', () => {
+                statusFilter = 'none';
+                applyFilters();
+              });
+            }
+          }
+        } else {
+          // Filter normal dari allProducts
+          filteredProducts = allProducts.filter(p => {
+            const s = scannedCodes.has(String(p.codeProduct).toLowerCase());
+            return scanFilter === 'all' || (scanFilter === 'scanned' && s) || (scanFilter === 'unscanned' && !s);
+          });
+
+          renderProducts();
+
+          if (banner) banner.style.display = 'none';
+        }
+
         updateStats();
         updateFilterCounts();
       }
@@ -1872,6 +1917,7 @@ Data scan di device ini tetap tersimpan lokal.`);
 
       function resetScanTabUI() {
         scanFilter = 'all';
+        statusFilter = 'none'; // ✅ v1.0.9
 
         document.querySelectorAll('.lg-scan-tab').forEach(t => {
           const a = t.dataset.val === 'all';
@@ -2057,6 +2103,7 @@ Data scan di device ini tetap tersimpan lokal.`);
         } catch (e) {}
       }
 
+      // ✅ v1.0.9: updateStats dengan kartu clickable
       function updateStats() {
         const total = allProducts.length;
         const progress = allProducts.filter(p => scannedCodes.has(String(p.codeProduct).toLowerCase())).length;
@@ -2069,11 +2116,11 @@ Data scan di device ini tetap tersimpan lokal.`);
         const cards = [
           { l: 'Data In-Stock', v: total, c: '#1e293b' },
           { l: 'Total Scan', v: scanLog.length, c: '#1e293b' },
-          { l: '✅ Masuk', v: cnt('MASUK'), c: '#16a34a' },
-          { l: '⚠️ Sudah Discan', v: sudah, c: '#d97706' },
-          { l: '🟠 Salah Baki', v: cnt('SALAH BAKI'), c: '#ea580c' },
-          { l: '🟣 Terjual / Rusak', v: cnt('TERJUAL / RUSAK'), c: '#7c3aed' },
-          { l: '🔴 Barcode Tidak Ada', v: cnt('BARCODE TIDAK ADA'), c: '#dc2626' },
+          { l: '✅ Masuk', v: cnt('MASUK'), c: '#16a34a', filter: 'MASUK' },
+          { l: '⚠️ Sudah Discan', v: sudah, c: '#d97706', filter: 'SUDAH DISCAN' },
+          { l: '🟠 Salah Baki', v: cnt('SALAH BAKI'), c: '#ea580c', filter: 'SALAH BAKI' },
+          { l: '🟣 Terjual / Rusak', v: cnt('TERJUAL / RUSAK'), c: '#7c3aed', filter: 'TERJUAL / RUSAK' },
+          { l: '🔴 Barcode Tidak Ada', v: cnt('BARCODE TIDAK ADA'), c: '#dc2626', filter: 'BARCODE TIDAK ADA' },
           { l: '📊 Progress', v: `${progress}/${total} (${pct}%)`, c: '#2563eb' },
           { l: '⏳ Sisa', v: sisa < 0 ? 0 : sisa, c: '#64748b' },
         ];
@@ -2081,12 +2128,34 @@ Data scan di device ini tetap tersimpan lokal.`);
         const el = document.getElementById('lg-stats');
         if (!el) return;
 
-        el.innerHTML = cards.map(c => `
-          <div style="background:#fff;border:1px solid #e2e8f0;border-radius:8px;padding:8px 6px;text-align:center;">
-            <div style="font-size:1.05rem;font-weight:700;color:${c.c};">${c.v}</div>
-            <div style="font-size:0.6rem;color:#64748b;margin-top:2px;">${c.l}</div>
-          </div>
-        `).join('');
+        el.innerHTML = cards.map(c => {
+          const clickable = !!c.filter;
+          const active = c.filter && c.filter === statusFilter;
+          return `
+            <div class="${clickable ? 'lg-stat-clickable' : ''} ${active ? 'lg-stat-active' : ''}"
+                 data-filter="${c.filter || ''}"
+                 title="${clickable ? 'Klik untuk filter daftar' : ''}"
+                 style="background:#fff;border:1px solid #e2e8f0;border-radius:8px;padding:8px 6px;text-align:center;${clickable ? '' : 'cursor:default;'}">
+              <div style="font-size:1.05rem;font-weight:700;color:${c.c};">${c.v}</div>
+              <div style="font-size:0.6rem;color:#64748b;margin-top:2px;">${c.l}</div>
+            </div>
+          `;
+        }).join('');
+
+        // Attach click handlers ke kartu yang bisa di-klik
+        el.querySelectorAll('.lg-stat-clickable').forEach(card => {
+          card.addEventListener('click', () => {
+            const filter = card.dataset.filter;
+            if (!filter) return;
+            // Toggle: klik lagi = deselect
+            if (statusFilter === filter) {
+              statusFilter = 'none';
+            } else {
+              statusFilter = filter;
+            }
+            applyFilters();
+          });
+        });
 
         const bar = document.getElementById('lg-progress-bar');
         if (bar) {
@@ -2121,9 +2190,28 @@ Data scan di device ini tetap tersimpan lokal.`);
         bindImageLinks(el);
       }
 
+      // ✅ v1.0.9: Render normal dari allProducts (restore header)
       function renderProducts() {
         const el = document.getElementById('lg-products');
         if (!el) return;
+
+        // Restore header tabel ke mode normal
+        const table = el.closest('table');
+        if (table) {
+          const thead = table.querySelector('thead tr');
+          if (thead) {
+            thead.innerHTML = `
+              <th style="padding:8px;font-size:10px;color:#64748b;border-bottom:1px solid #e2e8f0;">No</th>
+              <th style="padding:8px;text-align:left;font-size:10px;color:#64748b;border-bottom:1px solid #e2e8f0;">CodeProduct</th>
+              <th style="padding:8px;text-align:left;font-size:10px;color:#64748b;border-bottom:1px solid #e2e8f0;">Nama</th>
+              <th style="padding:8px;text-align:center;font-size:10px;color:#64748b;border-bottom:1px solid #e2e8f0;">Baki</th>
+              <th style="padding:8px;text-align:center;font-size:10px;color:#64748b;border-bottom:1px solid #e2e8f0;">Berat</th>
+              <th style="padding:8px;text-align:center;font-size:10px;color:#64748b;border-bottom:1px solid #e2e8f0;">Kadar</th>
+              <th style="padding:8px;text-align:right;font-size:10px;color:#64748b;border-bottom:1px solid #e2e8f0;">Harga</th>
+              <th style="padding:8px;text-align:center;font-size:10px;color:#64748b;border-bottom:1px solid #e2e8f0;">✓</th>
+            `;
+          }
+        }
 
         if (!filteredProducts.length) {
           const m = scanFilter === 'unscanned'
@@ -2148,6 +2236,47 @@ Data scan di device ini tetap tersimpan lokal.`);
             <td style="padding:5px 8px;text-align:center;font-size:10px;">${esc(p.kadar)}</td>
             <td style="padding:5px 8px;text-align:right;font-size:10px;">Rp${Number(p.price).toLocaleString('id-ID')}</td>
             <td style="padding:5px 8px;text-align:center;">${sc ? '✅' : '⬜'}</td>
+          </tr>`;
+        }).join('');
+
+        bindImageLinks(el);
+      }
+
+      // ✅ v1.0.9: Render tabel dari scanLog (saat filter status aktif)
+      function renderProductsFromLog() {
+        const el = document.getElementById('lg-products');
+        if (!el) return;
+
+        // Ganti header tabel ke mode log
+        const table = el.closest('table');
+        if (table) {
+          const thead = table.querySelector('thead tr');
+          if (thead) {
+            thead.innerHTML = `
+              <th style="padding:8px;font-size:10px;color:#64748b;border-bottom:1px solid #e2e8f0;">Waktu</th>
+              <th style="padding:8px;text-align:left;font-size:10px;color:#64748b;border-bottom:1px solid #e2e8f0;">CodeProduct</th>
+              <th style="padding:8px;text-align:left;font-size:10px;color:#64748b;border-bottom:1px solid #e2e8f0;">Nama</th>
+              <th style="padding:8px;text-align:center;font-size:10px;color:#64748b;border-bottom:1px solid #e2e8f0;">Baki</th>
+              <th style="padding:8px;text-align:center;font-size:10px;color:#64748b;border-bottom:1px solid #e2e8f0;">Oleh</th>
+              <th style="padding:8px;text-align:center;font-size:10px;color:#64748b;border-bottom:1px solid #e2e8f0;">Status</th>
+            `;
+          }
+        }
+
+        if (!filteredProducts.length) {
+          el.innerHTML = `<tr><td colspan="6" style="text-align:center;color:#94a3b8;padding:16px;">Belum ada scan dengan status "${esc(statusFilter)}"</td></tr>`;
+          return;
+        }
+
+        el.innerHTML = filteredProducts.map(l => {
+          const s = Object.values(ST).find(x => x.label === l.status) || ST.TIDAK_ADA;
+          return `<tr style="border-bottom:1px solid #f1f5f9;">
+            <td style="padding:5px 8px;font-size:10px;color:#94a3b8;white-space:nowrap;">${esc(l.time || '-')}</td>
+            <td style="padding:5px 8px;">${l.codeProduct && l.codeProduct !== '-' ? `<a href="#" class="lg-img-link" data-img="${escAttr(l.image)}" data-name="${escAttr(l.name)}" style="color:#2563eb;text-decoration:none;font-weight:600;font-size:11px;font-family:monospace;">${esc(l.codeProduct)}</a>` : '-'}</td>
+            <td style="padding:5px 8px;font-size:11px;max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(l.name || '-')}</td>
+            <td style="padding:5px 8px;text-align:center;font-size:10px;color:#64748b;">${esc(l.tray || '-')}</td>
+            <td style="padding:5px 8px;text-align:center;font-size:10px;color:#64748b;">${esc(l.by || '-')}</td>
+            <td style="padding:5px 8px;text-align:center;"><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:9px;font-weight:700;color:${s.color};background:${s.bg};border:1px solid ${s.bd};white-space:nowrap;">${esc(l.status)}</span></td>
           </tr>`;
         }).join('');
 
@@ -2246,6 +2375,7 @@ Data scan di device ini tetap tersimpan lokal.`);
           formQueue = [];
           formRetryCount = 0;
           initialCloudSyncDone = false;
+          statusFilter = 'none'; // ✅ v1.0.9
 
           updateStatus('🔄 Mereset progress sesi…');
         } else {
@@ -2255,6 +2385,7 @@ Data scan di device ini tetap tersimpan lokal.`);
           scannedCodes = new Set();
           formFilledCodes = new Set();
           formQueue = [];
+          statusFilter = 'none'; // ✅ v1.0.9
 
           localStorage.removeItem('lg_scanLog');
 
@@ -2343,7 +2474,7 @@ Lanjutkan?`)) return;
           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;padding-bottom:12px;border-bottom:2px solid #e2e8f0;">
             <div>
               <div style="font-size:18px;font-weight:800;color:#1e293b;">📦 LiaGold Scanner</div>
-              <div style="font-size:11px;color:#64748b;margin-top:2px;">Stock Opname · Multiplayer + Merge Solo <b style="color:#16a34a;">v26</b></div>
+              <div style="font-size:11px;color:#64748b;margin-top:2px;">Stock Opname · Multiplayer + Merge Solo <b style="color:#16a34a;">v27</b></div>
             </div>
             <button id="lg-close" style="background:#f1f5f9;border:1px solid #e2e8f0;color:#64748b;border-radius:6px;padding:6px 12px;cursor:pointer;font-size:14px;">✕</button>
           </div>
@@ -2374,6 +2505,12 @@ Lanjutkan?`)) return;
 
           <div id="lg-stats" style="display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-bottom:12px;"></div>
 
+          <!-- ✅ v1.0.9: Filter banner -->
+          <div id="lg-filter-banner" style="display:none;padding:10px 14px;background:linear-gradient(90deg,#eff6ff,#dbeafe);border:1.5px solid #93c5fd;border-radius:8px;font-size:12px;color:#1e3a8a;margin-bottom:12px;align-items:center;justify-content:space-between;gap:10px;">
+            <span>🔍 <span id="lg-filter-banner-text"></span></span>
+            <button id="lg-clear-filter-btn" style="padding:5px 12px;background:#2563eb;color:#fff;border:none;border-radius:5px;cursor:pointer;font-size:11px;font-weight:700;white-space:nowrap;">✕ Reset Filter</button>
+          </div>
+
           <div style="background:#fff;border:1px solid #e2e8f0;border-radius:8px;padding:14px;margin-bottom:12px;">
             <div style="display:flex;gap:8px;">
               <input id="lg-scan-input" type="text" placeholder="Scan barcode / ketik CodeProduct lalu Enter…"
@@ -2387,7 +2524,7 @@ Lanjutkan?`)) return;
               </label>
             </div>
             <div style="margin-top:8px;font-size:10px;color:#94a3b8;line-height:1.6;">
-              ✅ Masuk · ⚠️ Sudah Discan · 🟠 Salah Baki · 🟣 Terjual/Rusak · 🔴 Barcode Tidak Ada — <b>semua otomatis</b>
+              ✅ Masuk · ⚠️ Sudah Discan · 🟠 Salah Baki · 🟣 Terjual/Rusak · 🔴 Barcode Tidak Ada — <b>semua otomatis</b> · <b style="color:#2563eb;">klik kartu untuk filter</b>
             </div>
           </div>
 
@@ -2517,9 +2654,11 @@ Lanjutkan?`)) return;
 
         document.addEventListener('click', onDocClick);
 
+        // ✅ v1.0.9: Tab click juga mereset statusFilter
         panel.querySelectorAll('.lg-scan-tab').forEach(tab => {
           tab.addEventListener('click', () => {
             scanFilter = tab.dataset.val;
+            statusFilter = 'none';
 
             panel.querySelectorAll('.lg-scan-tab').forEach(t => {
               const a = t === tab;
