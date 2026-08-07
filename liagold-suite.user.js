@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         LiaGold Suite — Totalizer + Scanner (Unified)
 // @namespace    liagold.suite.unified
-// @version      1.0.11
-// @description  Gabungan LiaGold Totalizer + LiaGold Scanner dengan full history sync + batch auto-fill + stop button
+// @version      1.0.12
+// @description  Gabungan LiaGold Totalizer + LiaGold Scanner dengan session TTL 12 jam + data auto-purge
 // @match        https://liagold.cuan.co/*
 // @match        http://liagold.cuan.co/*
 // @run-at       document-idle
@@ -667,6 +667,10 @@
       const MAX_SCAN_LOG = 2000;
       const MAX_FORM_RETRY = 20;
 
+      // ✅ v1.0.12: TTL constants
+      const DATA_TTL_MS = 12 * 60 * 60 * 1000; // 12 jam untuk data scan
+      const SESSION_TTL_MS = 12 * 60 * 60 * 1000; // 12 jam untuk sesi
+
       const ST = {
         MASUK:      { label: 'MASUK',             color: '#16a34a', bg: '#f0fdf4', bd: '#bbf7d0' },
         SUDAH:      { label: 'SUDAH DISCAN',      color: '#d97706', bg: '#fffbeb', bd: '#fde68a' },
@@ -727,7 +731,7 @@
       let isDeletingSession = false;
       let formQueue = [];
       let isProcessingForm = false;
-      let isStoppingForm = false; // ✅ v1.0.11: Stop button
+      let isStoppingForm = false;
       let formFilledCodes = new Set();
       let formRetryCount = 0;
       let formRetryTimer = null;
@@ -749,6 +753,10 @@
       let batchSize = parseInt(localStorage.getItem('lg_batchSize') || '25');
       let batchDelay = parseInt(localStorage.getItem('lg_batchDelay') || '1000');
 
+      // ✅ v1.0.12: Session expiry tracking
+      let sessionCreatedAt = null;
+      let purgeIntervalId = null;
+
       const sleep = ms => new Promise(r => setTimeout(r, ms));
       const isMulti = () => !!sessionId;
 
@@ -761,6 +769,152 @@
         const ts = timestamp || new Date().toISOString();
         const rand = Math.random().toString(36).substr(2, 6);
         return sanitizeKey(cp + '_' + ts + '_' + rand);
+      }
+
+      // ✅ v1.0.12: Check if entry is expired (>12 jam)
+      function isEntryExpired(entry) {
+        if (!entry || !entry.time) return false;
+        try {
+          const entryTime = new Date(entry.time).getTime();
+          const age = Date.now() - entryTime;
+          return age > DATA_TTL_MS;
+        } catch (e) {
+          return false;
+        }
+      }
+
+      // ✅ v1.0.12: Check if session is expired (>12 jam)
+      function isSessionExpired(createdAt) {
+        if (!createdAt) return false;
+        try {
+          const createdTime = new Date(createdAt).getTime();
+          const age = Date.now() - createdTime;
+          return age > SESSION_TTL_MS;
+        } catch (e) {
+          return false;
+        }
+      }
+
+      // ✅ v1.0.12: Purge expired entries from cloud
+      async function purgeExpiredEntries() {
+        if (!isMulti() || isDeletingSession) return;
+
+        const expiredKeys = [];
+        
+        Object.entries(cloudHistory || {}).forEach(([key, entry]) => {
+          if (isEntryExpired(entry)) {
+            expiredKeys.push(key);
+          }
+        });
+
+        if (expiredKeys.length === 0) return;
+
+        updateStatus(`🗑️ Menghapus ${expiredKeys.length} scan expired (>12 jam)...`);
+
+        let deleted = 0;
+        for (let i = 0; i < expiredKeys.length; i += 50) {
+          const batch = expiredKeys.slice(i, i + 50);
+          
+          for (const key of batch) {
+            try {
+              await fetch(`${FIREBASE}/opname/${sessionId}/history/${key}.json`, { method: 'DELETE' });
+              delete cloudHistory[key];
+              deleted++;
+            } catch (e) {}
+          }
+          
+          await sleep(100);
+        }
+
+        if (deleted > 0) {
+          updateStatus(`🗑️ ${deleted} scan expired dihapus otomatis.`);
+          onCloudUpdate();
+        }
+      }
+
+      // ✅ v1.0.12: Check and handle session expiry
+      async function checkSessionExpiry() {
+        if (!sessionId || isDeletingSession) return;
+
+        try {
+          const res = await fetch(`${FIREBASE}/opname/${sessionId}/meta.json`);
+          const meta = await res.json();
+
+          if (meta === null) {
+            onSessionDeletedRemotely();
+            return;
+          }
+
+          sessionCreatedAt = meta.dibuat || null;
+
+          if (sessionCreatedAt && isSessionExpired(sessionCreatedAt)) {
+            await deleteSessionSilent('expired');
+            return;
+          }
+
+          // Update countdown display
+          updateSessionCountdown();
+        } catch (e) {}
+      }
+
+      // ✅ v1.0.12: Silent delete session (auto-expiry)
+      async function deleteSessionSilent(reason) {
+        if (!sessionId || isDeletingSession) return;
+
+        isDeletingSession = true;
+
+        try {
+          persistScanLog();
+
+          const res = await fetch(`${FIREBASE}/opname/${sessionId}.json`, { method: 'DELETE' });
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+          cleanupSessionLocal();
+
+          const msg = reason === 'expired' 
+            ? '⏰ Sesi EXPIRED (>12 jam). Semua data dihapus otomatis.'
+            : '🗑️ Sesi dihapus.';
+          
+          updateStatus(msg);
+
+          if (reason === 'expired') {
+            alert(`⏰ Sesi telah EXPIRED (>12 jam).
+Semua data scan telah dihapus otomatis.
+Silakan buat sesi baru untuk melanjutkan.`);
+          }
+        } catch (e) {
+          updateStatus('❌ Gagal hapus sesi: ' + e.message);
+        } finally {
+          isDeletingSession = false;
+        }
+      }
+
+      // ✅ v1.0.12: Update session countdown display
+      function updateSessionCountdown() {
+        const countdownEl = document.getElementById('lg-session-countdown');
+        if (!countdownEl) return;
+
+        if (!sessionCreatedAt) {
+          countdownEl.style.display = 'none';
+          return;
+        }
+
+        const createdTime = new Date(sessionCreatedAt).getTime();
+        const expiresAt = createdTime + SESSION_TTL_MS;
+        const remaining = expiresAt - Date.now();
+
+        if (remaining <= 0) {
+          countdownEl.innerHTML = '⏰ Sesi EXPIRED';
+          countdownEl.style.color = '#dc2626';
+          return;
+        }
+
+        const hours = Math.floor(remaining / (60 * 60 * 1000));
+        const minutes = Math.floor((remaining % (60 * 60 * 1000)) / (60 * 1000));
+        const seconds = Math.floor((remaining % (60 * 1000)) / 1000);
+
+        countdownEl.innerHTML = `⏳ Sisa: <b>${hours}j ${minutes}m ${seconds}d</b>`;
+        countdownEl.style.color = remaining < 60 * 60 * 1000 ? '#dc2626' : '#16a34a';
       }
 
       function mapItem(item) {
@@ -873,24 +1027,17 @@
         }
       }
 
-      // ✅ v1.0.11: Filter berdasarkan baki aktif
       function shouldQueueToForm(entry) {
         if (!entry || !entry.codeProduct) return false;
         
-        // Hanya MASUK yang masuk form (produk dari baki aktif)
         if (entry.status !== 'MASUK') return false;
         
-        // Cek produk ada di baki aktif
         const product = productMap.get(String(entry.codeProduct).toLowerCase());
         if (product) {
-          // Baki aktif harus spesifik (bukan 'all')
           if (selectedTray === 'all') return false;
-          
-          // Produk harus berada di baki aktif
           return String(product.trayId) === selectedTray;
         }
         
-        // Jika produk tidak ada di productMap, cek dari entry.tray
         if (entry.tray && entry.tray !== '-') {
           const trayInfo = trayList.find(t => t.trayCode === entry.tray);
           if (trayInfo && selectedTray !== 'all') {
@@ -910,7 +1057,6 @@
         processFormQueue();
       }
 
-      // ✅ v1.0.11: Batch processing dengan stop button
       async function processFormQueue() {
         if (isProcessingForm) return;
         if (!formQueue.length) return;
@@ -948,7 +1094,6 @@
               break;
             }
             
-            // ✅ v1.0.11: Check batch limit
             if (batchCount >= batchSize && formQueue.length > 0) {
               updateStatus(`⏸️ Jeda batch: ${processed}/${totalItems} diproses. Menunggu ${batchDelay}ms...`);
               await sleep(batchDelay);
@@ -1002,7 +1147,6 @@
             processed++;
             batchCount++;
             
-            // ✅ v1.0.11: Small delay between items to prevent freezing
             await sleep(50);
           }
         } finally {
@@ -1158,17 +1302,20 @@
         updateStatus(`✅ ${ok}/${count} scan solo terunggah — progress LANJUT.`);
       }
 
+      // ✅ v1.0.12: Create session without "OPNAME-" prefix
       async function createSession() {
         const nama = document.getElementById('lg-mp-name').value.trim() || 'Anonim';
         myName = nama;
         localStorage.setItem('lg_mp_name', nama);
 
-        const code = 'OPNAME-' + Math.random().toString(36).substr(2, 5).toUpperCase();
+        // ✅ v1.0.12: Kode 6 karakter tanpa prefix
+        const code = Math.random().toString(36).substr(2, 6).toUpperCase();
 
         try {
           await fbPut(`/opname/${code}/meta`, {
             nama: 'Opname ' + new Date().toLocaleDateString('id-ID'),
-            dibuat: new Date().toISOString()
+            dibuat: new Date().toISOString(),
+            expiresAt: new Date(Date.now() + SESSION_TTL_MS).toISOString(),
           });
 
           await fbPut(`/opname/${code}/peserta/${myId}`, {
@@ -1178,6 +1325,7 @@
 
           sessionId = code;
           localStorage.setItem('lg_session', code);
+          sessionCreatedAt = new Date().toISOString();
 
           knownCloudKeys = new Set();
           initialCloudSyncDone = false;
@@ -1192,7 +1340,9 @@
           await migrateSoloScansToSession();
 
           listenSession();
+          startPurgeInterval();
           updateMpUI();
+          updateSessionCountdown();
           updateStatus(`✅ Sesi ${code} dibuat! COPY kodenya & bagikan ke rekan.`);
         } catch (e) {
           updateStatus('❌ Gagal buat sesi: ' + e.message + ' (cek Rules Firebase)');
@@ -1220,6 +1370,12 @@
             return;
           }
 
+          // ✅ v1.0.12: Check if session is expired
+          if (meta.dibuat && isSessionExpired(meta.dibuat)) {
+            updateStatus('❌ Sesi "' + code + '" sudah EXPIRED (>12 jam).');
+            return;
+          }
+
           await fbPut(`/opname/${code}/peserta/${myId}`, {
             nama: myName,
             join: new Date().toISOString()
@@ -1227,6 +1383,7 @@
 
           sessionId = code;
           localStorage.setItem('lg_session', code);
+          sessionCreatedAt = meta.dibuat || new Date().toISOString();
 
           knownCloudKeys = new Set();
           initialCloudSyncDone = false;
@@ -1241,7 +1398,9 @@
           await migrateSoloScansToSession();
 
           listenSession();
+          startPurgeInterval();
           updateMpUI();
+          updateSessionCountdown();
           updateStatus(`✅ Bergabung ke sesi ${code}!`);
         } catch (e) {
           updateStatus('❌ Gagal gabung: ' + e.message);
@@ -1254,6 +1413,7 @@
         }
 
         persistScanLog();
+        stopPurgeInterval();
         cleanupSessionLocal();
         updateStatus('🔴 Keluar dari sesi. Mode solo.');
       }
@@ -1265,6 +1425,7 @@
         }
 
         sessionId = null;
+        sessionCreatedAt = null;
         cloudHistory = {};
         participants = {};
         dupeCount = 0;
@@ -1287,6 +1448,8 @@
           clearTimeout(formRetryTimer);
           formRetryTimer = null;
         }
+
+        stopPurgeInterval();
 
         localStorage.removeItem('lg_session');
 
@@ -1317,12 +1480,40 @@ Semua device lain akan OTOMATIS keluar.
           const res = await fetch(`${FIREBASE}/opname/${sessionId}.json`, { method: 'DELETE' });
           if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
+          stopPurgeInterval();
           cleanupSessionLocal();
           updateStatus('🗑️ Sesi dihapus permanen. Semua peserta otomatis keluar.');
         } catch (e) {
           updateStatus('❌ Gagal hapus sesi: ' + e.message);
         } finally {
           isDeletingSession = false;
+        }
+      }
+
+      // ✅ v1.0.12: Start periodic purge check
+      function startPurgeInterval() {
+        stopPurgeInterval();
+        
+        purgeIntervalId = setInterval(() => {
+          if (isMulti() && !isDeletingSession) {
+            purgeExpiredEntries();
+            checkSessionExpiry();
+          }
+        }, 5 * 60 * 1000); // Setiap 5 menit
+
+        // Also run immediately
+        setTimeout(() => {
+          if (isMulti() && !isDeletingSession) {
+            purgeExpiredEntries();
+            checkSessionExpiry();
+          }
+        }, 2000);
+      }
+
+      function stopPurgeInterval() {
+        if (purgeIntervalId) {
+          clearInterval(purgeIntervalId);
+          purgeIntervalId = null;
         }
       }
 
@@ -1365,6 +1556,7 @@ Semua device lain akan OTOMATIS keluar.
         if (!sessionId || isDeletingSession) return;
 
         persistScanLog();
+        stopPurgeInterval();
         cleanupSessionLocal();
         updateStatus('🗑️ Sesi dihapus oleh peserta lain — kamu otomatis keluar.');
 
@@ -1645,16 +1837,18 @@ Data scan di device ini tetap tersimpan lokal.`);
               listenSession();
             }
           }, 2500);
-        };
+        });
       }
 
-      // ✅ v1.0.11: Filter auto-fill berdasarkan baki aktif
       function onCloudUpdate() {
         const newScannedCodes = new Set();
         const historyEntries = [];
 
         Object.values(cloudHistory || {}).forEach(v => {
           if (!v || !v.codeProduct) return;
+
+          // ✅ v1.0.12: Skip expired entries
+          if (isEntryExpired(v)) return;
 
           historyEntries.push({
             time: v.time ? new Date(v.time).toLocaleString('id-ID') : '-',
@@ -1699,14 +1893,15 @@ Data scan di device ini tetap tersimpan lokal.`);
           }
         });
 
-        // ✅ v1.0.11: Hanya queue ke form jika produk dari baki aktif
         if (initialCloudSyncDone && autoFillForm && newKeys.length) {
           newKeys.forEach(k => {
             const scan = cloudHistory[k];
             if (!scan || !scan.codeProduct) return;
             if (scan.by === myName) return;
             
-            // ✅ v1.0.11: Filter berdasarkan baki aktif
+            // ✅ v1.0.12: Skip expired entries
+            if (isEntryExpired(scan)) return;
+            
             if (!shouldQueueToForm(scan)) return;
             
             queueFormInput(scan.codeProduct);
@@ -1725,6 +1920,7 @@ Data scan di device ini tetap tersimpan lokal.`);
           updateStats();
           renderLog();
           applyFilters();
+          updateSessionCountdown();
         }, 200);
       }
 
@@ -1769,13 +1965,14 @@ Data scan di device ini tetap tersimpan lokal.`);
                 <b style="font-size:17px;color:#2563eb;letter-spacing:1px;font-family:monospace;">${esc(sessionId)}</b>
                 <button id="lg-mp-copy" style="padding:5px 12px;background:#2563eb;color:#fff;border:none;border-radius:5px;cursor:pointer;font-size:11px;font-weight:600;">📋 Copy</button>
               </div>
+              <div id="lg-session-countdown" style="margin-top:6px;font-size:10px;font-weight:600;"></div>
             </div>
             <div id="lg-mp-participants" style="font-size:11px;color:#475569;margin-bottom:10px;"></div>
             <div style="display:flex;gap:6px;flex-wrap:wrap;">
               <button id="lg-mp-leave" style="padding:7px 14px;background:#dc2626;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:11px;font-weight:600;">🚪 Keluar Sesi</button>
               <button id="lg-mp-delete" style="padding:7px 14px;background:#991b1b;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:11px;font-weight:600;">🗑️ Selesai & Hapus</button>
             </div>
-            <div style="margin-top:8px;font-size:10px;color:#94a3b8;line-height:1.5;">💡 Scan pemain lain otomatis terinput ke form kamu (sinkron real-time). Progress solo otomatis dimerge saat buat/gabung sesi.</div>
+            <div style="margin-top:8px;font-size:10px;color:#94a3b8;line-height:1.5;">💡 Scan pemain lain otomatis terinput ke form kamu (sinkron real-time). Progress solo otomatis dimerge saat buat/gabung sesi. ⏰ Sesi & data auto-expire 12 jam.</div>
           `;
 
           document.getElementById('lg-mp-leave').addEventListener('click', leaveSession);
@@ -1783,6 +1980,7 @@ Data scan di device ini tetap tersimpan lokal.`);
           document.getElementById('lg-mp-copy').addEventListener('click', copySessionCode);
 
           renderParticipants();
+          updateSessionCountdown();
         } else {
           box.innerHTML = `
             <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;">
@@ -1793,7 +1991,7 @@ Data scan di device ini tetap tersimpan lokal.`);
               style="width:100%;padding:8px 10px;border-radius:6px;border:1px solid #cbd5e1;font-size:12px;margin-bottom:8px;" />
             <button id="lg-mp-create" style="width:100%;padding:8px;background:#2563eb;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:11px;font-weight:600;margin-bottom:8px;">➕ Buat Sesi Baru <span style="font-weight:400;opacity:.85;">(progress solo ikut)</span></button>
             <div style="display:flex;gap:6px;">
-              <input id="lg-mp-code" type="text" placeholder="Kode sesi (OPNAME-XXXXX)"
+              <input id="lg-mp-code" type="text" placeholder="Kode sesi (6 karakter)"
                 style="flex:1;padding:8px 10px;border-radius:6px;border:1px solid #cbd5e1;font-size:12px;text-transform:uppercase;" />
               <button id="lg-mp-join" style="padding:8px 14px;background:#16a34a;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:11px;font-weight:600;">Gabung</button>
             </div>
@@ -2259,7 +2457,6 @@ Data scan di device ini tetap tersimpan lokal.`);
         showResult(msg, st, imgUrl);
         beep(st === ST.MASUK ? 880 : st === ST.SUDAH ? 440 : 220);
 
-        // ✅ v1.0.11: Hanya auto-queue ke form jika produk dari baki aktif
         if (autoFillForm && st === ST.MASUK && shouldQueueToForm(logEntry)) {
           queueFormInput(finalCodeProduct);
         }
@@ -2301,681 +2498,4 @@ Data scan di device ini tetap tersimpan lokal.`);
           { l: '🟠 Salah Baki', v: cnt('SALAH BAKI'), c: '#ea580c', filter: 'SALAH BAKI' },
           { l: '🟣 Terjual / Rusak', v: cnt('TERJUAL / RUSAK'), c: '#7c3aed', filter: 'TERJUAL / RUSAK' },
           { l: '🔴 Barcode Tidak Ada', v: cnt('BARCODE TIDAK ADA'), c: '#dc2626', filter: 'BARCODE TIDAK ADA' },
-          { l: '📊 Progress', v: `${progress}/${total} (${pct}%)`, c: '#2563eb' },
-          { l: '⏳ Sisa', v: sisa < 0 ? 0 : sisa, c: '#64748b' },
-        ];
-
-        const el = document.getElementById('lg-stats');
-        if (!el) return;
-
-        el.innerHTML = cards.map(c => {
-          const clickable = !!c.filter;
-          const active = c.filter && c.filter === statusFilter;
-          return `
-            <div class="${clickable ? 'lg-stat-clickable' : ''} ${active ? 'lg-stat-active' : ''}"
-                 data-filter="${c.filter || ''}"
-                 title="${clickable ? 'Klik untuk filter daftar' : ''}"
-                 style="background:#fff;border:1px solid #e2e8f0;border-radius:8px;padding:8px 6px;text-align:center;${clickable ? '' : 'cursor:default;'}">
-              <div style="font-size:1.05rem;font-weight:700;color:${c.c};">${c.v}</div>
-              <div style="font-size:0.6rem;color:#64748b;margin-top:2px;">${c.l}</div>
-            </div>
-          `;
-        }).join('');
-
-        el.querySelectorAll('.lg-stat-clickable').forEach(card => {
-          card.addEventListener('click', () => {
-            const filter = card.dataset.filter;
-            if (!filter) return;
-            if (statusFilter === filter) {
-              statusFilter = 'none';
-            } else {
-              statusFilter = filter;
-            }
-            applyFilters();
-          });
-        });
-
-        const bar = document.getElementById('lg-progress-bar');
-        if (bar) {
-          bar.style.width = pct + '%';
-          bar.textContent = pct > 8 ? pct + '%' : '';
-        }
-      }
-
-      function renderLog() {
-        const el = document.getElementById('lg-log');
-        if (!el) return;
-
-        if (!scanLog.length) {
-          el.innerHTML = '<tr><td colspan="7" style="text-align:center;color:#94a3b8;padding:16px;">Belum ada riwayat scan</td></tr>';
-          return;
-        }
-
-        el.innerHTML = scanLog.slice(0, 150).map(l => {
-          const s = Object.values(ST).find(x => x.label === l.status) || ST.TIDAK_ADA;
-
-          return `<tr style="border-bottom:1px solid #f1f5f9;">
-            <td style="padding:6px 8px;font-size:10px;color:#94a3b8;white-space:nowrap;">${esc(l.time)}</td>
-            <td style="padding:6px 8px;"><code style="background:#f1f5f9;padding:2px 6px;border-radius:4px;font-size:10px;border:1px solid #e2e8f0;">${esc(l.scanCode)}</code></td>
-            <td style="padding:6px 8px;font-size:11px;">${l.codeProduct !== '-' ? `<a href="#" class="lg-img-link" data-img="${escAttr(l.image)}" data-name="${escAttr(l.name)}" style="color:#2563eb;text-decoration:none;font-weight:600;">${esc(l.codeProduct)}</a>` : '-'}</td>
-            <td style="padding:6px 8px;font-size:11px;max-width:100px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(l.name)}</td>
-            <td style="padding:6px 8px;font-size:10px;text-align:center;color:#64748b;">${esc(l.tray)}</td>
-            <td style="padding:6px 8px;font-size:10px;text-align:center;color:#64748b;">${esc(l.by || '-')}</td>
-            <td style="padding:6px 8px;"><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:9px;font-weight:700;color:${s.color};background:${s.bg};border:1px solid ${s.bd};white-space:nowrap;">${esc(l.status)}</span></td>
-          </tr>`;
-        }).join('');
-
-        bindImageLinks(el);
-      }
-
-      function renderProducts() {
-        const el = document.getElementById('lg-products');
-        if (!el) return;
-
-        const table = el.closest('table');
-        if (table) {
-          const thead = table.querySelector('thead tr');
-          if (thead) {
-            thead.innerHTML = `
-              <th style="padding:8px;font-size:10px;color:#64748b;border-bottom:1px solid #e2e8f0;">No</th>
-              <th style="padding:8px;text-align:left;font-size:10px;color:#64748b;border-bottom:1px solid #e2e8f0;">CodeProduct</th>
-              <th style="padding:8px;text-align:left;font-size:10px;color:#64748b;border-bottom:1px solid #e2e8f0;">Nama</th>
-              <th style="padding:8px;text-align:center;font-size:10px;color:#64748b;border-bottom:1px solid #e2e8f0;">Baki</th>
-              <th style="padding:8px;text-align:center;font-size:10px;color:#64748b;border-bottom:1px solid #e2e8f0;">Berat</th>
-              <th style="padding:8px;text-align:center;font-size:10px;color:#64748b;border-bottom:1px solid #e2e8f0;">Kadar</th>
-              <th style="padding:8px;text-align:right;font-size:10px;color:#64748b;border-bottom:1px solid #e2e8f0;">Harga</th>
-              <th style="padding:8px;text-align:center;font-size:10px;color:#64748b;border-bottom:1px solid #e2e8f0;">✓</th>
-            `;
-          }
-        }
-
-        if (!filteredProducts.length) {
-          const m = scanFilter === 'unscanned'
-            ? '🎉 Semua sudah discan!'
-            : scanFilter === 'scanned'
-              ? 'Belum ada yang discan'
-              : 'Pilih baki untuk memuat';
-
-          el.innerHTML = `<tr><td colspan="8" style="text-align:center;color:#94a3b8;padding:16px;">${m}</td></tr>`;
-          return;
-        }
-
-        el.innerHTML = filteredProducts.map((p, i) => {
-          const sc = scannedCodes.has(String(p.codeProduct).toLowerCase());
-
-          return `<tr style="${sc ? 'opacity:0.45;background:#f0fdf4;' : ''}border-bottom:1px solid #f1f5f9;">
-            <td style="padding:5px 8px;text-align:center;font-size:10px;color:#94a3b8;">${i + 1}</td>
-            <td style="padding:5px 8px;"><a href="#" class="lg-img-link" data-img="${escAttr(p.image)}" data-name="${escAttr(p.name)}" style="color:#2563eb;text-decoration:none;font-weight:600;font-size:11px;font-family:monospace;">${esc(p.codeProduct)}</a></td>
-            <td style="padding:5px 8px;font-size:11px;max-width:130px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(p.name)}</td>
-            <td style="padding:5px 8px;text-align:center;font-size:10px;color:#64748b;">${esc(p.trayCode)}</td>
-            <td style="padding:5px 8px;text-align:center;font-size:10px;">${p.weight} gr</td>
-            <td style="padding:5px 8px;text-align:center;font-size:10px;">${esc(p.kadar)}</td>
-            <td style="padding:5px 8px;text-align:right;font-size:10px;">Rp${Number(p.price).toLocaleString('id-ID')}</td>
-            <td style="padding:5px 8px;text-align:center;">${sc ? '✅' : '⬜'}</td>
-          </tr>`;
-        }).join('');
-
-        bindImageLinks(el);
-      }
-
-      function renderProductsFromLog() {
-        const el = document.getElementById('lg-products');
-        if (!el) return;
-
-        const table = el.closest('table');
-        if (table) {
-          const thead = table.querySelector('thead tr');
-          if (thead) {
-            thead.innerHTML = `
-              <th style="padding:8px;font-size:10px;color:#64748b;border-bottom:1px solid #e2e8f0;">Waktu</th>
-              <th style="padding:8px;text-align:left;font-size:10px;color:#64748b;border-bottom:1px solid #e2e8f0;">CodeProduct</th>
-              <th style="padding:8px;text-align:left;font-size:10px;color:#64748b;border-bottom:1px solid #e2e8f0;">Nama</th>
-              <th style="padding:8px;text-align:center;font-size:10px;color:#64748b;border-bottom:1px solid #e2e8f0;">Baki</th>
-              <th style="padding:8px;text-align:center;font-size:10px;color:#64748b;border-bottom:1px solid #e2e8f0;">Oleh</th>
-              <th style="padding:8px;text-align:center;font-size:10px;color:#64748b;border-bottom:1px solid #e2e8f0;">Status</th>
-            `;
-          }
-        }
-
-        if (!filteredProducts.length) {
-          el.innerHTML = `<tr><td colspan="6" style="text-align:center;color:#94a3b8;padding:16px;">Belum ada scan dengan status "${esc(statusFilter)}"</td></tr>`;
-          return;
-        }
-
-        el.innerHTML = filteredProducts.map(l => {
-          const s = Object.values(ST).find(x => x.label === l.status) || ST.TIDAK_ADA;
-          return `<tr style="border-bottom:1px solid #f1f5f9;">
-            <td style="padding:5px 8px;font-size:10px;color:#94a3b8;white-space:nowrap;">${esc(l.time || '-')}</td>
-            <td style="padding:5px 8px;">${l.codeProduct && l.codeProduct !== '-' ? `<a href="#" class="lg-img-link" data-img="${escAttr(l.image)}" data-name="${escAttr(l.name)}" style="color:#2563eb;text-decoration:none;font-weight:600;font-size:11px;font-family:monospace;">${esc(l.codeProduct)}</a>` : '-'}</td>
-            <td style="padding:5px 8px;font-size:11px;max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(l.name || '-')}</td>
-            <td style="padding:5px 8px;text-align:center;font-size:10px;color:#64748b;">${esc(l.tray || '-')}</td>
-            <td style="padding:5px 8px;text-align:center;font-size:10px;color:#64748b;">${esc(l.by || '-')}</td>
-            <td style="padding:5px 8px;text-align:center;"><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:9px;font-weight:700;color:${s.color};background:${s.bg};border:1px solid ${s.bd};white-space:nowrap;">${esc(l.status)}</span></td>
-          </tr>`;
-        }).join('');
-
-        bindImageLinks(el);
-      }
-
-      function showImageModal(imgUrl, name) {
-        let ov = document.getElementById('lg-img-overlay');
-        if (ov) ov.remove();
-
-        ov = document.createElement('div');
-        ov.id = 'lg-img-overlay';
-        ov.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:100000;display:flex;align-items:center;justify-content:center;cursor:pointer;';
-
-        ov.innerHTML = `<div style="background:#fff;border-radius:12px;padding:24px;max-width:520px;width:90%;text-align:center;cursor:default;box-shadow:0 20px 60px rgba(0,0,0,0.25);animation:lgPop .18s ease;">
-          <div style="font-weight:700;font-size:14px;color:#1e293b;margin-bottom:14px;">${esc(name || 'Produk')}</div>
-          ${imgUrl ? `<img src="${escAttr(imgUrl)}" style="max-width:100%;max-height:400px;border-radius:8px;border:1px solid #e2e8f0;" onerror="this.outerHTML='<div style=\\'padding:40px;color:#94a3b8;\\'>Gambar tidak tersedia</div>'" />` : '<div style="padding:40px;color:#94a3b8;">Gambar tidak tersedia</div>'}
-          <div style="margin-top:16px;"><button id="lg-img-close-btn" style="padding:8px 28px;background:#1e293b;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;">Tutup</button></div>
-        </div>`;
-
-        ov.addEventListener('click', e => {
-          if (e.target === ov) ov.remove();
-        });
-
-        document.body.appendChild(ov);
-        document.getElementById('lg-img-close-btn').addEventListener('click', () => ov.remove());
-      }
-
-      function bindImageLinks(c) {
-        c.querySelectorAll('.lg-img-link').forEach(a => {
-          a.onclick = e => {
-            e.preventDefault();
-            showImageModal(a.dataset.img, a.dataset.name);
-          };
-        });
-      }
-
-      function updateStatus(msg) {
-        const el = document.getElementById('lg-status');
-        if (el) el.textContent = msg;
-      }
-
-      function showResult(msg, st, imgUrl) {
-        const el = document.getElementById('lg-result');
-        if (!el) return;
-
-        el.style.display = 'block';
-        el.style.background = st.bg;
-        el.style.border = `1px solid ${st.bd}`;
-        el.style.color = st.color;
-        el.innerHTML = `<div style="font-weight:700;font-size:13px;">${msg}</div>`;
-
-        if (imgUrl) {
-          el.innerHTML += `<div style="margin-top:6px;"><a href="#" class="lg-img-link" data-img="${escAttr(imgUrl)}" data-name="" style="color:#2563eb;font-size:11px;text-decoration:underline;">📷 Lihat Gambar</a></div>`;
-          bindImageLinks(el);
-        }
-
-        el.classList.remove('lg-result-anim');
-        void el.offsetWidth;
-        el.classList.add('lg-result-anim');
-      }
-
-      function exportLog() {
-        if (!scanLog.length) {
-          updateStatus('⚠️ Tidak ada data untuk di-export.');
-          return;
-        }
-
-        const csvEsc = s => '"' + String(s ?? '').replace(/"/g, '""') + '"';
-
-        let csv = '\uFEFF' + ['Waktu','Kode Scan','CodeProduct','Code','Nama Barang','Baki','Oleh','Status'].map(csvEsc).join(',') + '\n';
-
-        scanLog.forEach(l => {
-          csv += [l.time, l.scanCode, l.codeProduct, l.code, l.name, l.tray, l.by || '-', l.status].map(csvEsc).join(',') + '\n';
-        });
-
-        const a = document.createElement('a');
-        a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8;' }));
-        a.download = `scan_log_${new Date().toISOString().slice(0, 10)}.csv`;
-        a.click();
-
-        setTimeout(() => URL.revokeObjectURL(a.href), 5000);
-        updateStatus('✅ CSV berhasil di-export (' + scanLog.length + ' baris).');
-      }
-
-      function resetProgress() {
-        if (isMulti()) {
-          if (!confirm('Reset SEMUA progress sesi (untuk semua peserta)?')) return;
-
-          fetch(`${FIREBASE}/opname/${sessionId}/history.json`, { method: 'DELETE' });
-          fetch(`${FIREBASE}/opname/${sessionId}/scans.json`, { method: 'DELETE' });
-          fetch(`${FIREBASE}/opname/${sessionId}/dupes.json`, { method: 'DELETE' });
-
-          pendingLocalScans = new Set();
-          knownCloudKeys = new Set();
-          formFilledCodes = new Set();
-          formQueue = [];
-          formRetryCount = 0;
-          initialCloudSyncDone = false;
-          statusFilter = 'none';
-
-          updateStatus('🔄 Mereset progress sesi…');
-        } else {
-          if (!confirm('Reset semua progress scan?')) return;
-
-          scanLog = [];
-          scannedCodes = new Set();
-          formFilledCodes = new Set();
-          formQueue = [];
-          statusFilter = 'none';
-
-          localStorage.removeItem('lg_scanLog');
-
-          updateStats();
-          renderLog();
-          applyFilters();
-
-          updateStatus('🔄 Progress direset.');
-        }
-      }
-
-      async function sendToForm() {
-        if (isProcessingForm) {
-          updateStatus('⚠️ Proses sedang berjalan. Klik "⏹ Stop" untuk menghentikan.');
-          return;
-        }
-
-        const input = getFormInput();
-        if (!input) {
-          updateStatus('❌ Form tidak ditemukan. Buka /stock-opname/create.');
-          return;
-        }
-
-        const scannedList = [...scannedCodes];
-        if (!scannedList.length) {
-          updateStatus('⚠️ Belum ada barang yang discan.');
-          return;
-        }
-
-        updateStatus('🔍 Memeriksa isi form…');
-
-        const formTextLower = getFormListText();
-        const missing = scannedList.filter(code => !isCodeInForm(code, formTextLower) && !formFilledCodes.has(code));
-        const already = scannedList.length - missing.length;
-
-        if (!missing.length) {
-          updateStatus(`✅ Semua ${scannedList.length} barang sudah ada di form.`);
-          return;
-        }
-
-        if (!confirm(`📊 Hasil pemeriksaan form:
-✅ Sudah ada di form : ${already} barang
-📤 Belum ada di form : ${missing.length} barang
-Lanjutkan?`)) return;
-
-        missing.forEach(code => queueFormInput(code));
-        updateStatus(`📤 Mengirim ${missing.length} barang ke form (batch: ${batchSize}, delay: ${batchDelay}ms)...`);
-      }
-
-      // ✅ v1.0.11: Stop button handler
-      function stopFormQueue() {
-        if (isProcessingForm) {
-          isStoppingForm = true;
-          updateStatus('⏹ Menghentikan proses auto-fill...');
-        } else {
-          updateStatus('⚠️ Tidak ada proses yang sedang berjalan.');
-        }
-      }
-
-      // ✅ v1.0.11: Update batch settings
-      function updateBatchSettings() {
-        const sizeInput = document.getElementById('lg-batch-size');
-        const delayInput = document.getElementById('lg-batch-delay');
-        
-        if (sizeInput) {
-          const newSize = parseInt(sizeInput.value) || 25;
-          batchSize = Math.max(1, Math.min(100, newSize));
-          sizeInput.value = batchSize;
-          localStorage.setItem('lg_batchSize', batchSize);
-        }
-        
-        if (delayInput) {
-          const newDelay = parseInt(delayInput.value) || 1000;
-          batchDelay = Math.max(100, Math.min(10000, newDelay));
-          delayInput.value = batchDelay;
-          localStorage.setItem('lg_batchDelay', batchDelay);
-        }
-        
-        updateStatus(`⚙️ Batch settings: ${batchSize} barang/batch, ${batchDelay}ms delay`);
-      }
-
-      function togglePanel() {
-        panelVisible = !panelVisible;
-
-        const p = document.getElementById('lg-panel');
-        const f = document.getElementById('lg-fab');
-
-        if (panelVisible) {
-          p.style.display = 'block';
-          f.textContent = '✕';
-          f.style.background = '#dc2626';
-          setTimeout(() => document.getElementById('lg-scan-input')?.focus(), 100);
-        } else {
-          p.style.display = 'none';
-          f.textContent = '📦';
-          f.style.background = '#2563eb';
-        }
-      }
-
-      window.__lgCloseScannerPanel = () => {
-        if (panelVisible) togglePanel();
-      };
-
-      function onDocClick(e) {
-        if (!e.target.closest('#lg-tray-search') && !e.target.closest('#lg-tray-dropdown')) {
-          const dd = document.getElementById('lg-tray-dropdown');
-          if (dd) dd.style.display = 'none';
-        }
-      }
-
-      function injectUI() {
-        document.getElementById('lg-panel')?.remove();
-        document.getElementById('lg-fab')?.remove();
-        document.removeEventListener('click', onDocClick);
-
-        const panel = document.createElement('div');
-        panel.id = 'lg-panel';
-        panel.style.cssText = `position:fixed;top:0;right:0;width:50vw;min-width:500px;height:100vh;background:#f8fafc;color:#1e293b;font-family:system-ui,-apple-system,'Segoe UI',sans-serif;font-size:13px;overflow-y:auto;z-index:99999;border-left:1px solid #e2e8f0;box-shadow:-4px 0 24px rgba(0,0,0,0.08);padding:24px;display:none;`;
-
-        panel.innerHTML = `
-          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;padding-bottom:12px;border-bottom:2px solid #e2e8f0;">
-            <div>
-              <div style="font-size:18px;font-weight:800;color:#1e293b;">📦 LiaGold Scanner</div>
-              <div style="font-size:11px;color:#64748b;margin-top:2px;">Stock Opname · Multiplayer + Merge Solo <b style="color:#16a34a;">v29</b></div>
-            </div>
-            <button id="lg-close" style="background:#f1f5f9;border:1px solid #e2e8f0;color:#64748b;border-radius:6px;padding:6px 12px;cursor:pointer;font-size:14px;">✕</button>
-          </div>
-
-          <div id="lg-status" style="font-size:12px;color:#64748b;margin-bottom:12px;padding:8px 12px;background:#fff;border:1px solid #e2e8f0;border-radius:6px;">Pilih baki untuk memulai</div>
-
-          <div style="background:#fff;border:1px solid #e2e8f0;border-radius:8px;padding:14px;margin-bottom:12px;">
-            <div style="font-size:10px;font-weight:700;color:#475569;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:10px;">👥 Multiplayer</div>
-            <div id="lg-mp-box"></div>
-          </div>
-
-          <div style="background:#fff;border:1px solid #e2e8f0;border-radius:8px;padding:14px;margin-bottom:12px;">
-            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-              <span style="font-size:10px;font-weight:700;color:#475569;text-transform:uppercase;letter-spacing:0.5px;">🗂️ Baki <span style="color:#dc2626;">*</span></span>
-              <button id="lg-sync-btn" style="padding:3px 10px;background:#f1f5f9;border:1px solid #cbd5e1;border-radius:4px;cursor:pointer;font-size:10px;color:#64748b;font-weight:600;">🔄 Sinkron Baki</button>
-            </div>
-            <div style="position:relative;">
-              <input id="lg-tray-search" type="text" placeholder="Pilih Baki (wajib untuk scan)" autocomplete="off"
-                style="width:100%;padding:10px 12px;border-radius:6px;border:1px solid #cbd5e1;font-size:13px;background:#fff;color:#1e293b;font-weight:600;" />
-              <div id="lg-tray-dropdown" style="display:none;position:absolute;top:100%;left:0;right:0;background:#fff;border:1px solid #cbd5e1;border-radius:6px;max-height:220px;overflow-y:auto;z-index:10;box-shadow:0 4px 12px rgba(0,0,0,0.1);margin-top:4px;"></div>
-            </div>
-            <div id="lg-tray-info" style="margin-top:6px;font-size:10px;color:#94a3b8;">⚠️ Pilih baki spesifik untuk memulai scan</div>
-          </div>
-
-          <div style="background:#e2e8f0;border-radius:8px;height:24px;overflow:hidden;margin-bottom:12px;">
-            <div id="lg-progress-bar" style="height:100%;background:linear-gradient(90deg,#2563eb,#3b82f6);width:0%;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;color:#fff;transition:width 0.4s;border-radius:8px;"></div>
-          </div>
-
-          <div id="lg-stats" style="display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-bottom:12px;"></div>
-
-          <div id="lg-filter-banner" style="display:none;padding:10px 14px;background:linear-gradient(90deg,#eff6ff,#dbeafe);border:1.5px solid #93c5fd;border-radius:8px;font-size:12px;color:#1e3a8a;margin-bottom:12px;align-items:center;justify-content:space-between;gap:10px;">
-            <span>🔍 <span id="lg-filter-banner-text"></span></span>
-            <button id="lg-clear-filter-btn" style="padding:5px 12px;background:#2563eb;color:#fff;border:none;border-radius:5px;cursor:pointer;font-size:11px;font-weight:700;white-space:nowrap;">✕ Reset Filter</button>
-          </div>
-
-          <div style="background:#fff;border:1px solid #e2e8f0;border-radius:8px;padding:14px;margin-bottom:12px;">
-            <div style="display:flex;gap:8px;">
-              <input id="lg-scan-input" type="text" placeholder="Scan barcode / ketik CodeProduct lalu Enter…"
-                style="flex:1;padding:12px 16px;border-radius:8px;border:2px solid #2563eb;font-size:15px;font-weight:600;color:#1e293b;" />
-              <button id="lg-scan-btn" style="padding:12px 20px;background:#2563eb;color:#fff;border:none;border-radius:8px;cursor:pointer;font-weight:700;font-size:14px;">CEK</button>
-            </div>
-            <div style="margin-top:10px;">
-              <label style="display:flex;align-items:center;gap:8px;font-size:11px;color:#64748b;cursor:pointer;user-select:none;">
-                <input type="checkbox" id="lg-autofill" checked style="accent-color:#2563eb;width:14px;height:14px;" />
-                Auto-isi & sinkron form <span style="color:#94a3b8;">(hanya produk dari baki aktif)</span>
-              </label>
-            </div>
-            <div style="margin-top:8px;font-size:10px;color:#94a3b8;line-height:1.6;">
-              ✅ Masuk · ⚠️ Sudah Discan · 🟠 Salah Baki · 🟣 Terjual/Rusak · 🔴 Barcode Tidak Ada — <b>semua otomatis</b> · <b style="color:#2563eb;">klik kartu untuk filter</b>
-            </div>
-          </div>
-
-          <div id="lg-result" style="display:none;padding:12px 16px;border-radius:8px;font-size:13px;margin-bottom:12px;line-height:1.6;"></div>
-
-          <!-- ✅ v1.0.11: Batch settings + Stop button -->
-          <div style="background:#fff;border:1px solid #e2e8f0;border-radius:8px;padding:14px;margin-bottom:12px;">
-            <div style="font-size:10px;font-weight:700;color:#475569;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:10px;">⚙️ Auto-Fill Settings</div>
-            <div style="display:flex;gap:10px;align-items:center;margin-bottom:10px;">
-              <label style="font-size:11px;color:#64748b;white-space:nowrap;">Batch:</label>
-              <input id="lg-batch-size" type="number" min="1" max="100" value="${batchSize}"
-                style="width:60px;padding:5px 8px;border-radius:4px;border:1px solid #cbd5e1;font-size:11px;" />
-              <span style="font-size:11px;color:#94a3b8;">barang</span>
-              <label style="font-size:11px;color:#64748b;white-space:nowrap;margin-left:10px;">Delay:</label>
-              <input id="lg-batch-delay" type="number" min="100" max="10000" step="100" value="${batchDelay}"
-                style="width:70px;padding:5px 8px;border-radius:4px;border:1px solid #cbd5e1;font-size:11px;" />
-              <span style="font-size:11px;color:#94a3b8;">ms</span>
-              <button id="lg-apply-batch-btn" style="padding:5px 12px;background:#16a34a;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:10px;font-weight:600;margin-left:auto;">✓ Apply</button>
-            </div>
-            <div style="display:flex;gap:6px;flex-wrap:wrap;">
-              <button id="lg-send-form-btn" style="padding:8px 16px;background:#2563eb;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:12px;font-weight:600;">📤 Kirim ke Form</button>
-              <button id="lg-stop-form-btn" style="padding:8px 16px;background:#dc2626;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:12px;font-weight:600;">⏹ Stop</button>
-              <button id="lg-export-btn" style="padding:8px 16px;background:#16a34a;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:12px;font-weight:600;">📥 Export CSV</button>
-              <button id="lg-reset-btn" style="padding:8px 16px;background:#dc2626;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:12px;font-weight:600;">🔄 Reset Progress</button>
-            </div>
-          </div>
-
-          <div style="background:#fff;border:1px solid #e2e8f0;border-radius:8px;margin-bottom:14px;overflow:hidden;">
-            <div style="padding:10px 14px;border-bottom:1px solid #e2e8f0;font-weight:700;font-size:12px;color:#475569;">📜 Riwayat Scan</div>
-            <div style="max-height:220px;overflow-y:auto;">
-              <table style="width:100%;border-collapse:collapse;">
-                <thead>
-                  <tr style="background:#f8fafc;position:sticky;top:0;">
-                    <th style="padding:8px;text-align:left;font-size:10px;color:#64748b;border-bottom:1px solid #e2e8f0;">Waktu</th>
-                    <th style="padding:8px;text-align:left;font-size:10px;color:#64748b;border-bottom:1px solid #e2e8f0;">Kode</th>
-                    <th style="padding:8px;text-align:left;font-size:10px;color:#64748b;border-bottom:1px solid #e2e8f0;">CodeProduct</th>
-                    <th style="padding:8px;text-align:left;font-size:10px;color:#64748b;border-bottom:1px solid #e2e8f0;">Nama</th>
-                    <th style="padding:8px;text-align:center;font-size:10px;color:#64748b;border-bottom:1px solid #e2e8f0;">Baki</th>
-                    <th style="padding:8px;text-align:center;font-size:10px;color:#64748b;border-bottom:1px solid #e2e8f0;">Oleh</th>
-                    <th style="padding:8px;text-align:left;font-size:10px;color:#64748b;border-bottom:1px solid #e2e8f0;">Status</th>
-                  </tr>
-                </thead>
-                <tbody id="lg-log"></tbody>
-              </table>
-            </div>
-          </div>
-
-          <div style="background:#fff;border:1px solid #e2e8f0;border-radius:8px;overflow:hidden;">
-            <div style="padding:10px 14px;border-bottom:1px solid #e2e8f0;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
-              <span style="font-weight:700;font-size:12px;color:#475569;">📋 Daftar Barang</span>
-              <div style="display:flex;gap:4px;">
-                <button class="lg-scan-tab" data-val="all" style="padding:5px 12px;border-radius:5px;border:1px solid #2563eb;background:#2563eb;color:#fff;font-size:10px;cursor:pointer;font-weight:600;">Semua <span class="lg-tab-count">0</span></button>
-                <button class="lg-scan-tab" data-val="scanned" style="padding:5px 12px;border-radius:5px;border:1px solid #cbd5e1;background:#fff;color:#64748b;font-size:10px;cursor:pointer;font-weight:600;">✅ Sudah <span class="lg-tab-count">0</span></button>
-                <button class="lg-scan-tab" data-val="unscanned" style="padding:5px 12px;border-radius:5px;border:1px solid #cbd5e1;background:#fff;color:#64748b;font-size:10px;cursor:pointer;font-weight:600;">⬜ Belum <span class="lg-tab-count">0</span></button>
-              </div>
-            </div>
-            <div style="max-height:340px;overflow-y:auto;">
-              <table style="width:100%;border-collapse:collapse;">
-                <thead>
-                  <tr style="background:#f8fafc;position:sticky;top:0;">
-                    <th style="padding:8px;font-size:10px;color:#64748b;border-bottom:1px solid #e2e8f0;">No</th>
-                    <th style="padding:8px;text-align:left;font-size:10px;color:#64748b;border-bottom:1px solid #e2e8f0;">CodeProduct</th>
-                    <th style="padding:8px;text-align:left;font-size:10px;color:#64748b;border-bottom:1px solid #e2e8f0;">Nama</th>
-                    <th style="padding:8px;text-align:center;font-size:10px;color:#64748b;border-bottom:1px solid #e2e8f0;">Baki</th>
-                    <th style="padding:8px;text-align:center;font-size:10px;color:#64748b;border-bottom:1px solid #e2e8f0;">Berat</th>
-                    <th style="padding:8px;text-align:center;font-size:10px;color:#64748b;border-bottom:1px solid #e2e8f0;">Kadar</th>
-                    <th style="padding:8px;text-align:right;font-size:10px;color:#64748b;border-bottom:1px solid #e2e8f0;">Harga</th>
-                    <th style="padding:8px;text-align:center;font-size:10px;color:#64748b;border-bottom:1px solid #e2e8f0;">✓</th>
-                  </tr>
-                </thead>
-                <tbody id="lg-products"></tbody>
-              </table>
-            </div>
-          </div>
-        `;
-
-        document.body.appendChild(panel);
-
-        const fab = document.createElement('button');
-        fab.id = 'lg-fab';
-        fab.textContent = '📦';
-        fab.style.cssText = `position:fixed;bottom:24px;right:24px;width:56px;height:56px;border-radius:50%;background:#2563eb;color:#fff;font-size:24px;border:none;cursor:pointer;z-index:99998;box-shadow:0 4px 16px rgba(37,99,235,0.4);`;
-
-        fab.onmouseenter = () => fab.style.transform = 'scale(1.1)';
-        fab.onmouseleave = () => fab.style.transform = 'scale(1)';
-
-        document.body.appendChild(fab);
-
-        fab.addEventListener('click', togglePanel);
-        document.getElementById('lg-close').addEventListener('click', togglePanel);
-
-        document.getElementById('lg-scan-input').addEventListener('keydown', e => {
-          if (e.key === 'Enter') {
-            e.preventDefault();
-            const inp = document.getElementById('lg-scan-input');
-            const val = inp.value.trim();
-            if (val) {
-              enqueueScan(val);
-              inp.value = '';
-            }
-          }
-        });
-
-        document.getElementById('lg-scan-btn').addEventListener('click', () => {
-          const inp = document.getElementById('lg-scan-input');
-          const val = inp.value.trim();
-          if (val) {
-            enqueueScan(val);
-            inp.value = '';
-          }
-        });
-
-        document.getElementById('lg-export-btn').addEventListener('click', exportLog);
-        document.getElementById('lg-reset-btn').addEventListener('click', resetProgress);
-        document.getElementById('lg-sync-btn').addEventListener('click', syncTrayList);
-        document.getElementById('lg-send-form-btn').addEventListener('click', sendToForm);
-        
-        // ✅ v1.0.11: Stop button
-        document.getElementById('lg-stop-form-btn').addEventListener('click', stopFormQueue);
-        document.getElementById('lg-apply-batch-btn').addEventListener('click', updateBatchSettings);
-
-        document.getElementById('lg-autofill').addEventListener('change', e => {
-          autoFillForm = e.target.checked;
-        });
-
-        const traySearch = document.getElementById('lg-tray-search');
-        const trayDrop = document.getElementById('lg-tray-dropdown');
-
-        traySearch.addEventListener('focus', () => {
-          renderTrayDropdown(traySearch.value);
-          trayDrop.style.display = 'block';
-        });
-
-        traySearch.addEventListener('input', () => {
-          renderTrayDropdown(traySearch.value);
-          trayDrop.style.display = 'block';
-        });
-
-        traySearch.addEventListener('keydown', e => {
-          if (e.key === 'Enter') {
-            e.preventDefault();
-            const first = trayDrop.querySelector('.lg-tray-opt');
-            if (first) first.click();
-          }
-          if (e.key === 'Escape') trayDrop.style.display = 'none';
-        });
-
-        document.addEventListener('click', onDocClick);
-
-        panel.querySelectorAll('.lg-scan-tab').forEach(tab => {
-          tab.addEventListener('click', () => {
-            scanFilter = tab.dataset.val;
-            statusFilter = 'none';
-
-            panel.querySelectorAll('.lg-scan-tab').forEach(t => {
-              const a = t === tab;
-              t.style.background = a ? '#2563eb' : '#fff';
-              t.style.color = a ? '#fff' : '#64748b';
-              t.style.borderColor = a ? '#2563eb' : '#cbd5e1';
-            });
-
-            applyFilters();
-          });
-        });
-      }
-
-      function init() {
-        if (initialized) return;
-        initialized = true;
-
-        injectStyles();
-        injectUI();
-        updateMpUI();
-        renderLog();
-        updateStats();
-
-        if (isMulti()) {
-          listenSession();
-          updateStatus(`🟢 Menyambung ke sesi ${sessionId}…`);
-        }
-
-        if (trayList.length) {
-          renderTrayDropdown('');
-          if (!isMulti()) updateStatus(`✅ ${trayList.length} baki tersedia · Pilih baki spesifik untuk scan`);
-        } else {
-          syncTrayList();
-        }
-      }
-
-      if (document.readyState === 'complete' || document.readyState === 'interactive') {
-        setTimeout(init, 500);
-      } else {
-        window.addEventListener('DOMContentLoaded', () => setTimeout(init, 500));
-      }
-    })();
-  }
-
-  function bootByRoute() {
-    applyRouteClass();
-
-    if (isTotalPage()) startTotalizer();
-    if (isScannerPage()) startScanner();
-  }
-
-  let lastHref = location.href;
-
-  function onRouteChange() {
-    if (location.href === lastHref) return;
-
-    lastHref = location.href;
-    applyRouteClass();
-
-    const ov = document.getElementById('lg-img-overlay');
-    if (ov) ov.remove();
-
-    if (window.__lgCloseScannerPanel) window.__lgCloseScannerPanel();
-
-    if (window.__lgtTriggerNav) window.__lgtTriggerNav();
-
-    setTimeout(bootByRoute, 150);
-    setTimeout(bootByRoute, 800);
-    setTimeout(bootByRoute, 2200);
-  }
-
-  const originalPush = history.pushState;
-  const originalReplace = history.replaceState;
-
-  history.pushState = function (...args) {
-    const res = originalPush.apply(this, args);
-    onRouteChange();
-    return res;
-  };
-
-  history.replaceState = function (...args) {
-    const res = originalReplace.apply(this, args);
-    onRouteChange();
-    return res;
-  };
-
-  addEventListener('popstate', onRouteChange);
-  addEventListener('hashchange', onRouteChange);
-  setInterval(onRouteChange, 900);
-
-  bootByRoute();
-})();
+          { l: '📊 Progress', v: `${progress}/${total} (${pct}%)`, c: '#25
