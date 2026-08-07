@@ -1,15 +1,3 @@
-Masalahnya ada pada **Regex URL Pathname** yang terlalu ketat (`^\/stock-opname\/?$`). Regex lama hanya mendeteksi URL yang **persis** `/stock-opname` tanpa prefix (seperti `/admin/...` atau `/app/...`) dan tanpa query string/parameter.
-
-Akibatnya, class `.lgs-scanner-on` (untuk Scanner) dan `.lgt-page-on` (untuk Totalizer) tidak pernah ditambahkan ke elemen `<html>`, sehingga CSS bawaan script (`display: none !important`) otomatis menyembunyikan floating box (`#lg-fab` dan `#lgt-fab`).
-
-Berikut adalah perbaikan:
-1. **Regex diperlonggar** menggunakan pola `/\/nama-halaman(?:\/|\?|$)/` agar bisa mendeteksi path di dalam subfolder maupun yang memiliki query string.
-2. **Menambahkan `Tokenizer`** ke dalam daftar halaman Totalizer.
-3. Versi dinaikkan ke **1.0.14**.
-
-### Kode Lengkap yang Sudah Diperbaiki
-
-```javascript
 // ==UserScript==
 // @name         LiaGold Suite — Totalizer + Scanner (Unified)
 // @namespace    liagold.suite.unified
@@ -3221,4 +3209,3 @@ Lanjutkan?`)) return;
 
   bootByRoute();
 })();
-```
