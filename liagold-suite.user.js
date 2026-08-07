@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         LiaGold Suite — Totalizer + Scanner (Unified)
 // @namespace    liagold.suite.unified
-// @version      1.0.9
-// @description  Gabungan LiaGold Totalizer + LiaGold Scanner dengan selection memory + anti-blink + filter kartu status
+// @version      1.0.10
+// @description  Gabungan LiaGold Totalizer + LiaGold Scanner dengan full history sync + filter kartu status
 // @match        https://liagold.cuan.co/*
 // @match        http://liagold.cuan.co/*
 // @run-at       document-idle
@@ -705,7 +705,7 @@
       let selectedTray = 'all';
       let traySelected = false;
       let scanFilter = 'all';
-      let statusFilter = 'none'; // ✅ v1.0.9: Filter kartu status
+      let statusFilter = 'none';
       let autoFillForm = true;
       let scanLog = safeParse('lg_scanLog', []);
       let scannedCodes = new Set(scanLog.filter(l => l.status === 'MASUK').map(l => String(l.codeProduct).toLowerCase()));
@@ -717,7 +717,7 @@
         return id;
       })();
 
-      let cloudScans = {};
+      let cloudHistory = {}; // ✅ v1.0.10: Ganti cloudScans dengan cloudHistory
       let participants = {};
       let dupeCount = 0;
       let es = null;
@@ -749,6 +749,14 @@
 
       function sanitizeKey(str) {
         return String(str).replace(/[.#$\[\]\/]/g, '_');
+      }
+
+      // ✅ v1.0.10: Generate unique key per scan event
+      function generateHistoryKey(codeProduct, timestamp) {
+        const cp = String(codeProduct || '').toLowerCase();
+        const ts = timestamp || new Date().toISOString();
+        const rand = Math.random().toString(36).substr(2, 6);
+        return sanitizeKey(cp + '_' + ts + '_' + rand);
       }
 
       function mapItem(item) {
@@ -789,7 +797,6 @@
           .lg-tray-opt { transition: background .12s ease; }
           .lg-result-anim { animation: lgPop .18s ease; }
           #lg-fab { transition: transform .2s ease, box-shadow .2s ease !important; }
-          /* ✅ v1.0.9: Stat card clickable + active */
           .lg-stat-clickable { cursor: pointer; user-select: none; transition: transform .15s ease, box-shadow .15s ease, outline .15s ease; }
           .lg-stat-clickable:hover { transform: translateY(-2px); box-shadow: 0 4px 12px rgba(0,0,0,.10); }
           .lg-stat-clickable.lg-stat-active { outline: 2.5px solid #2563eb !important; outline-offset: 1px; transform: scale(1.04); box-shadow: 0 4px 14px rgba(37,99,235,.30); }
@@ -957,21 +964,22 @@
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
       }
 
+      // ✅ v1.0.10: Push SEMUA status ke /history/ dengan unique key
       async function pushScanToCloud(entry, retries = 3) {
         if (!isMulti()) return;
 
-        const key = sanitizeKey(entry.codeProduct.toLowerCase());
+        const uniqueKey = generateHistoryKey(entry.codeProduct, entry.time);
 
         for (let i = 0; i < retries; i++) {
           if (!isMulti()) return;
 
           try {
-            await fbPut(`/opname/${sessionId}/scans/${key}`, entry);
+            await fbPut(`/opname/${sessionId}/history/${uniqueKey}`, entry);
             return;
           } catch (e) {
             if (i === retries - 1) {
               updateStatus('⚠️ Gagal kirim ke cloud setelah ' + retries + 'x. Data di-queue.');
-              pendingCloudPushes.push(entry);
+              pendingCloudPushes.push({ ...entry, uniqueKey });
               scheduleRetryPush();
             } else {
               await sleep(400 * (i + 1));
@@ -980,6 +988,7 @@
         }
       }
 
+      // ✅ v1.0.10: Retry push ke /history/
       function scheduleRetryPush() {
         if (retryTimer) return;
 
@@ -996,10 +1005,10 @@
               break;
             }
 
-            const key = sanitizeKey(entry.codeProduct.toLowerCase());
+            const uniqueKey = entry.uniqueKey || generateHistoryKey(entry.codeProduct, entry.time);
 
             try {
-              await fbPut(`/opname/${sessionId}/scans/${key}`, entry);
+              await fbPut(`/opname/${sessionId}/history/${uniqueKey}`, entry);
             } catch (e) {
               pendingCloudPushes.push(entry);
             }
@@ -1011,6 +1020,7 @@
         }, 5000);
       }
 
+      // ✅ v1.0.10: Migrate solo scans ke /history/ (semua status)
       async function migrateSoloScansToSession() {
         if (!scanLog.length) return;
 
@@ -1018,26 +1028,34 @@
 
         scanLog.forEach(l => {
           if (!l || !l.codeProduct) return;
-          const k = String(l.codeProduct).toLowerCase();
+          const k = String(l.codeProduct).toLowerCase() + '_' + (l.timeIso || l.time || '');
           if (!byCode.has(k)) byCode.set(k, l);
         });
 
         let existingKeys = new Set();
 
         try {
-          const res = await fetch(`${FIREBASE}/opname/${sessionId}/scans.json`);
+          // ✅ v1.0.10: Baca dari /history/ bukan /scans/
+          const res = await fetch(`${FIREBASE}/opname/${sessionId}/history.json`);
           const data = await res.json();
           if (data) existingKeys = new Set(Object.keys(data));
+          
+          // ✅ v1.0.10: Backward compat - juga cek /scans/ lama
+          const res2 = await fetch(`${FIREBASE}/opname/${sessionId}/scans.json`);
+          const data2 = await res2.json();
+          if (data2) {
+            Object.keys(data2).forEach(k => existingKeys.add(k));
+          }
         } catch (e) {}
 
         const payload = {};
         let count = 0;
 
         byCode.forEach((l, k) => {
-          const sKey = sanitizeKey(k);
-          if (existingKeys.has(sKey)) return;
+          const uniqueKey = generateHistoryKey(l.codeProduct, l.timeIso || l.time);
+          if (existingKeys.has(uniqueKey)) return;
 
-          payload[sKey] = {
+          payload[uniqueKey] = {
             by: myName,
             time: l.timeIso || new Date().toISOString(),
             status: l.status,
@@ -1068,7 +1086,7 @@
           });
 
           try {
-            const res = await fetch(`${FIREBASE}/opname/${sessionId}/scans.json`, {
+            const res = await fetch(`${FIREBASE}/opname/${sessionId}/history.json`, {
               method: 'PATCH',
               body: JSON.stringify(batch)
             });
@@ -1193,7 +1211,7 @@
         }
 
         sessionId = null;
-        cloudScans = {};
+        cloudHistory = {};
         participants = {};
         dupeCount = 0;
         knownCloudKeys = new Set();
@@ -1204,7 +1222,7 @@
         pendingLocalScans = new Set();
         pendingCloudPushes = [];
         esFailCount = 0;
-        statusFilter = 'none'; // ✅ v1.0.9
+        statusFilter = 'none';
 
         if (retryTimer) {
           clearTimeout(retryTimer);
@@ -1230,7 +1248,7 @@
       async function deleteSession() {
         if (!sessionId || isDeletingSession) return;
 
-        const totalScans = Object.keys(cloudScans).length;
+        const totalScans = Object.keys(cloudHistory).length;
 
         if (!confirm(`Hapus sesi ${sessionId} PERMANEN dari cloud?
  ${totalScans} data scan akan dihapus untuk SEMUA peserta.
@@ -1301,6 +1319,7 @@ Kamu otomatis kembali ke MODE SOLO.
 Data scan di device ini tetap tersimpan lokal.`);
       }
 
+      // ✅ v1.0.10: Listen untuk /history/ events
       function listenSession() {
         if (es) es.close();
 
@@ -1321,7 +1340,20 @@ Data scan di device ini tetap tersimpan lokal.`);
               return;
             }
 
-            cloudScans = data.scans || {};
+            // ✅ v1.0.10: Baca dari /history/ dan backward compat /scans/
+            cloudHistory = data.history || {};
+            
+            // Backward compat: merge data lama dari /scans/
+            if (data.scans) {
+              Object.entries(data.scans).forEach(([k, v]) => {
+                if (!v || !v.codeProduct) return;
+                const uniqueKey = generateHistoryKey(v.codeProduct, v.time || '');
+                if (!cloudHistory[uniqueKey]) {
+                  cloudHistory[uniqueKey] = v;
+                }
+              });
+            }
+            
             participants = data.peserta || {};
             dupeCount = data.dupes ? Object.keys(data.dupes).length : 0;
 
@@ -1330,22 +1362,49 @@ Data scan di device ini tetap tersimpan lokal.`);
             return;
           }
 
-          if (path === '/scans') {
+          // ✅ v1.0.10: Listen untuk /history/ events
+          if (path === '/history') {
             if (data === null) {
-              cloudScans = {};
+              cloudHistory = {};
               onCloudUpdate();
               return;
             }
 
-            cloudScans = data;
+            cloudHistory = data;
             onCloudUpdate();
             return;
           }
 
-          if (path.startsWith('/scans/')) {
-            const k = path.slice('/scans/'.length);
-            if (data === null) delete cloudScans[k];
-            else cloudScans[k] = data;
+          if (path.startsWith('/history/')) {
+            const k = path.slice('/history/'.length);
+            if (data === null) delete cloudHistory[k];
+            else cloudHistory[k] = data;
+
+            onCloudUpdate();
+            return;
+          }
+
+          // ✅ v1.0.10: Backward compat untuk /scans/ lama
+          if (path === '/scans' || path.startsWith('/scans/')) {
+            const scansData = path === '/scans' ? data : null;
+            
+            if (scansData && typeof scansData === 'object') {
+              Object.entries(scansData).forEach(([k, v]) => {
+                if (!v || !v.codeProduct) return;
+                const uniqueKey = generateHistoryKey(v.codeProduct, v.time || '');
+                if (!cloudHistory[uniqueKey]) {
+                  cloudHistory[uniqueKey] = v;
+                }
+              });
+            } else if (path.startsWith('/scans/')) {
+              const k = path.slice('/scans/'.length);
+              if (data && data.codeProduct) {
+                const uniqueKey = generateHistoryKey(data.codeProduct, data.time || '');
+                if (!cloudHistory[uniqueKey]) {
+                  cloudHistory[uniqueKey] = data;
+                }
+              }
+            }
 
             onCloudUpdate();
             return;
@@ -1389,9 +1448,20 @@ Data scan di device ini tetap tersimpan lokal.`);
 
           if (path === '/') {
             Object.entries(data || {}).forEach(([k, v]) => {
-              if (k === 'scans') cloudScans = v || {};
+              if (k === 'history') cloudHistory = v || {};
               if (k === 'peserta') participants = v || {};
               if (k === 'dupes') dupeCount = v ? Object.keys(v).length : 0;
+              
+              // Backward compat
+              if (k === 'scans' && v && typeof v === 'object') {
+                Object.entries(v).forEach(([sk, sv]) => {
+                  if (!sv || !sv.codeProduct) return;
+                  const uniqueKey = generateHistoryKey(sv.codeProduct, sv.time || '');
+                  if (!cloudHistory[uniqueKey]) {
+                    cloudHistory[uniqueKey] = sv;
+                  }
+                });
+              }
             });
 
             onCloudUpdate();
@@ -1399,24 +1469,56 @@ Data scan di device ini tetap tersimpan lokal.`);
             return;
           }
 
-          if (path === '/scans') {
+          if (path === '/history') {
             Object.entries(data || {}).forEach(([k, v]) => {
-              if (v === null) delete cloudScans[k];
-              else cloudScans[k] = v;
+              if (v === null) delete cloudHistory[k];
+              else cloudHistory[k] = v;
             });
 
             onCloudUpdate();
             return;
           }
 
-          if (path.startsWith('/scans/')) {
-            const k = path.slice('/scans/'.length);
-            if (!cloudScans[k]) cloudScans[k] = {};
+          if (path.startsWith('/history/')) {
+            const k = path.slice('/history/'.length);
+            if (!cloudHistory[k]) cloudHistory[k] = {};
 
             Object.entries(data || {}).forEach(([subK, v]) => {
-              if (v === null) delete cloudScans[k][subK];
-              else cloudScans[k][subK] = v;
+              if (v === null) delete cloudHistory[k][subK];
+              else cloudHistory[k][subK] = v;
             });
+
+            onCloudUpdate();
+            return;
+          }
+
+          // Backward compat untuk /scans/
+          if (path === '/scans' || path.startsWith('/scans/')) {
+            const scansData = path === '/scans' ? data : null;
+            
+            if (scansData && typeof scansData === 'object') {
+              Object.entries(scansData).forEach(([k, v]) => {
+                if (!v || !v.codeProduct) return;
+                const uniqueKey = generateHistoryKey(v.codeProduct, v.time || '');
+                if (!cloudHistory[uniqueKey]) {
+                  cloudHistory[uniqueKey] = v;
+                }
+              });
+            } else if (path.startsWith('/scans/')) {
+              const k = path.slice('/scans/'.length);
+              const entryData = path === '/scans' ? data : null;
+              
+              if (entryData && typeof entryData === 'object') {
+                Object.entries(entryData).forEach(([subK, v]) => {
+                  if (v === null) return;
+                  if (!v.codeProduct) return;
+                  const uniqueKey = generateHistoryKey(v.codeProduct, v.time || '');
+                  if (!cloudHistory[uniqueKey]) {
+                    cloudHistory[uniqueKey] = v;
+                  }
+                });
+              }
+            }
 
             onCloudUpdate();
             return;
@@ -1466,7 +1568,19 @@ Data scan di device ini tetap tersimpan lokal.`);
                 return;
               }
 
-              cloudScans = data.scans || {};
+              // ✅ v1.0.10: Merge /history/ dan /scans/
+              cloudHistory = data.history || {};
+              
+              if (data.scans) {
+                Object.entries(data.scans).forEach(([k, v]) => {
+                  if (!v || !v.codeProduct) return;
+                  const uniqueKey = generateHistoryKey(v.codeProduct, v.time || '');
+                  if (!cloudHistory[uniqueKey]) {
+                    cloudHistory[uniqueKey] = v;
+                  }
+                });
+              }
+              
               participants = data.peserta || {};
               dupeCount = data.dupes ? Object.keys(data.dupes).length : 0;
 
@@ -1488,11 +1602,28 @@ Data scan di device ini tetap tersimpan lokal.`);
         };
       }
 
+      // ✅ v1.0.10: onCloudUpdate baca dari cloudHistory
       function onCloudUpdate() {
         const newScannedCodes = new Set();
+        const historyEntries = [];
 
-        Object.values(cloudScans).forEach(v => {
-          if (v && v.status === 'MASUK' && v.codeProduct) {
+        Object.values(cloudHistory || {}).forEach(v => {
+          if (!v || !v.codeProduct) return;
+
+          historyEntries.push({
+            time: v.time ? new Date(v.time).toLocaleString('id-ID') : '-',
+            timeIso: v.time || '',
+            scanCode: v.scanCode || v.codeProduct,
+            codeProduct: v.codeProduct,
+            code: v.code || '-',
+            name: v.name || '-',
+            tray: v.tray || '-',
+            image: v.image || '',
+            status: v.status || '',
+            by: v.by || '',
+          });
+
+          if (v.status === 'MASUK') {
             newScannedCodes.add(String(v.codeProduct).toLowerCase());
           }
         });
@@ -1501,30 +1632,22 @@ Data scan di device ini tetap tersimpan lokal.`);
         scannedCodes = newScannedCodes;
 
         pendingLocalScans.forEach(rawCode => {
-          const sKey = sanitizeKey(rawCode);
-          if (cloudScans[sKey]) pendingLocalScans.delete(rawCode);
+          // Find and remove from pending if exists in cloud
+          let found = false;
+          Object.values(cloudHistory || {}).forEach(v => {
+            if (v && v.codeProduct && String(v.codeProduct).toLowerCase() === rawCode) {
+              found = true;
+            }
+          });
+          if (found) pendingLocalScans.delete(rawCode);
         });
 
-        scanLog = Object.entries(cloudScans)
-          .filter(([k, v]) => v && typeof v === 'object')
-          .map(([k, v]) => ({
-            time: v.time ? new Date(v.time).toLocaleString('id-ID') : '-',
-            timeIso: v.time || '',
-            scanCode: v.codeProduct || k,
-            codeProduct: v.codeProduct || k.toUpperCase(),
-            code: v.code || '-',
-            name: v.name || '-',
-            tray: v.tray || '-',
-            image: v.image || '',
-            status: v.status || '',
-            by: v.by || '',
-          }))
-          .sort((a, b) => (b.timeIso || '').localeCompare(a.timeIso || ''));
+        scanLog = historyEntries.sort((a, b) => (b.timeIso || '').localeCompare(a.timeIso || ''));
 
         debouncedPersist();
 
         const newKeys = [];
-        Object.keys(cloudScans).forEach(k => {
+        Object.keys(cloudHistory || {}).forEach(k => {
           if (!knownCloudKeys.has(k)) {
             knownCloudKeys.add(k);
             newKeys.push(k);
@@ -1533,7 +1656,7 @@ Data scan di device ini tetap tersimpan lokal.`);
 
         if (initialCloudSyncDone && autoFillForm && newKeys.length) {
           newKeys.forEach(k => {
-            const scan = cloudScans[k];
+            const scan = cloudHistory[k];
             if (!scan || !scan.codeProduct) return;
             if (scan.by === myName) return;
             if (scan.status === 'MASUK' || scan.status === 'SALAH BAKI') queueFormInput(scan.codeProduct);
@@ -1806,7 +1929,7 @@ Data scan di device ini tetap tersimpan lokal.`);
       function selectTray(val, label) {
         selectedTray = val;
         traySelected = (val !== 'all');
-        statusFilter = 'none'; // ✅ v1.0.9: Reset filter kartu status
+        statusFilter = 'none';
 
         document.getElementById('lg-tray-search').value = label;
         document.getElementById('lg-tray-dropdown').style.display = 'none';
@@ -1856,14 +1979,12 @@ Data scan di device ini tetap tersimpan lokal.`);
         }
       }
 
-      // ✅ v1.0.9: applyFilters dengan dukungan statusFilter
       function applyFilters() {
         const banner = document.getElementById('lg-filter-banner');
         const bannerText = document.getElementById('lg-filter-banner-text');
         const clearBtn = document.getElementById('lg-clear-filter-btn');
 
         if (statusFilter !== 'none') {
-          // Filter dari scanLog berdasarkan status
           filteredProducts = scanLog.filter(l => l.status === statusFilter);
 
           renderProductsFromLog();
@@ -1889,7 +2010,6 @@ Data scan di device ini tetap tersimpan lokal.`);
             }
           }
         } else {
-          // Filter normal dari allProducts
           filteredProducts = allProducts.filter(p => {
             const s = scannedCodes.has(String(p.codeProduct).toLowerCase());
             return scanFilter === 'all' || (scanFilter === 'scanned' && s) || (scanFilter === 'unscanned' && !s);
@@ -1917,7 +2037,7 @@ Data scan di device ini tetap tersimpan lokal.`);
 
       function resetScanTabUI() {
         scanFilter = 'all';
-        statusFilter = 'none'; // ✅ v1.0.9
+        statusFilter = 'none';
 
         document.querySelectorAll('.lg-scan-tab').forEach(t => {
           const a = t.dataset.val === 'all';
@@ -1961,6 +2081,7 @@ Data scan di device ini tetap tersimpan lokal.`);
         if (input) input.focus();
       }
 
+      // ✅ v1.0.10: Push SEMUA status ke cloud
       async function doScanInternal(code) {
         if (!traySelected) {
           showResult('⚠️ Pilih baki spesifik terlebih dahulu sebelum scan!', ST.TIDAK_ADA, '');
@@ -1996,7 +2117,18 @@ Data scan di device ini tetap tersimpan lokal.`);
           if (scannedCodes.has(cpL) || pendingLocalScans.has(cpL)) {
             st = ST.SUDAH;
             const sKey = sanitizeKey(cpL);
-            const byWhom = isMulti() && cloudScans[sKey]?.by ? ` (oleh ${esc(cloudScans[sKey].by)})` : '';
+            
+            // ✅ v1.0.10: Cari siapa yang scan duluan dari cloudHistory
+            let byWhom = '';
+            if (isMulti()) {
+              const foundEntry = Object.values(cloudHistory).find(v => 
+                v && v.codeProduct && String(v.codeProduct).toLowerCase() === cpL && v.status === 'MASUK'
+              );
+              if (foundEntry && foundEntry.by) {
+                byWhom = ` (oleh ${esc(foundEntry.by)})`;
+              }
+            }
+            
             msg = `SUDAH DISCAN — "${esc(found.name)}" (${esc(found.codeProduct)}) · Baki ${esc(found.trayCode)}${byWhom}`;
             pushDupe(found.codeProduct);
           } else if (String(found.trayId) !== selectedTray) {
@@ -2044,30 +2176,30 @@ Data scan di device ini tetap tersimpan lokal.`);
           by: myName || '',
         };
 
+        // ✅ v1.0.10: Selalu push SEMUA status ke cloud
         if (isMulti()) {
-          if (st !== ST.SUDAH) {
-            if (st === ST.MASUK) {
-              scannedCodes.add(finalCodeProduct.toLowerCase());
-              pendingLocalScans.add(finalCodeProduct.toLowerCase());
-            }
+          scanLog.unshift(logEntry);
+          if (scanLog.length > MAX_SCAN_LOG) scanLog = scanLog.slice(0, MAX_SCAN_LOG);
 
-            scanLog.unshift(logEntry);
-            if (scanLog.length > MAX_SCAN_LOG) scanLog = scanLog.slice(0, MAX_SCAN_LOG);
-
-            debouncedPersist();
-            scheduleRender();
-
-            await pushScanToCloud({
-              by: myName,
-              time: now.toISOString(),
-              status: st.label,
-              codeProduct: finalCodeProduct,
-              code: finalCode,
-              name: finalName,
-              tray: finalTray,
-              image: imgUrl,
-            });
+          if (st === ST.MASUK) {
+            scannedCodes.add(finalCodeProduct.toLowerCase());
+            pendingLocalScans.add(finalCodeProduct.toLowerCase());
           }
+
+          debouncedPersist();
+          scheduleRender();
+
+          // ✅ v1.0.10: Push ke /history/ untuk SEMUA status
+          await pushScanToCloud({
+            by: myName,
+            time: now.toISOString(),
+            status: st.label,
+            codeProduct: finalCodeProduct,
+            code: finalCode,
+            name: finalName,
+            tray: finalTray,
+            image: imgUrl,
+          });
         } else {
           if (st === ST.MASUK) scannedCodes.add(finalCodeProduct.toLowerCase());
 
@@ -2103,7 +2235,6 @@ Data scan di device ini tetap tersimpan lokal.`);
         } catch (e) {}
       }
 
-      // ✅ v1.0.9: updateStats dengan kartu clickable
       function updateStats() {
         const total = allProducts.length;
         const progress = allProducts.filter(p => scannedCodes.has(String(p.codeProduct).toLowerCase())).length;
@@ -2142,12 +2273,10 @@ Data scan di device ini tetap tersimpan lokal.`);
           `;
         }).join('');
 
-        // Attach click handlers ke kartu yang bisa di-klik
         el.querySelectorAll('.lg-stat-clickable').forEach(card => {
           card.addEventListener('click', () => {
             const filter = card.dataset.filter;
             if (!filter) return;
-            // Toggle: klik lagi = deselect
             if (statusFilter === filter) {
               statusFilter = 'none';
             } else {
@@ -2190,12 +2319,10 @@ Data scan di device ini tetap tersimpan lokal.`);
         bindImageLinks(el);
       }
 
-      // ✅ v1.0.9: Render normal dari allProducts (restore header)
       function renderProducts() {
         const el = document.getElementById('lg-products');
         if (!el) return;
 
-        // Restore header tabel ke mode normal
         const table = el.closest('table');
         if (table) {
           const thead = table.querySelector('thead tr');
@@ -2242,12 +2369,10 @@ Data scan di device ini tetap tersimpan lokal.`);
         bindImageLinks(el);
       }
 
-      // ✅ v1.0.9: Render tabel dari scanLog (saat filter status aktif)
       function renderProductsFromLog() {
         const el = document.getElementById('lg-products');
         if (!el) return;
 
-        // Ganti header tabel ke mode log
         const table = el.closest('table');
         if (table) {
           const thead = table.querySelector('thead tr');
@@ -2366,6 +2491,8 @@ Data scan di device ini tetap tersimpan lokal.`);
         if (isMulti()) {
           if (!confirm('Reset SEMUA progress sesi (untuk semua peserta)?')) return;
 
+          // ✅ v1.0.10: Hapus /history/ dan /scans/ dan /dupes/
+          fetch(`${FIREBASE}/opname/${sessionId}/history.json`, { method: 'DELETE' });
           fetch(`${FIREBASE}/opname/${sessionId}/scans.json`, { method: 'DELETE' });
           fetch(`${FIREBASE}/opname/${sessionId}/dupes.json`, { method: 'DELETE' });
 
@@ -2375,7 +2502,7 @@ Data scan di device ini tetap tersimpan lokal.`);
           formQueue = [];
           formRetryCount = 0;
           initialCloudSyncDone = false;
-          statusFilter = 'none'; // ✅ v1.0.9
+          statusFilter = 'none';
 
           updateStatus('🔄 Mereset progress sesi…');
         } else {
@@ -2385,7 +2512,7 @@ Data scan di device ini tetap tersimpan lokal.`);
           scannedCodes = new Set();
           formFilledCodes = new Set();
           formQueue = [];
-          statusFilter = 'none'; // ✅ v1.0.9
+          statusFilter = 'none';
 
           localStorage.removeItem('lg_scanLog');
 
@@ -2474,7 +2601,7 @@ Lanjutkan?`)) return;
           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;padding-bottom:12px;border-bottom:2px solid #e2e8f0;">
             <div>
               <div style="font-size:18px;font-weight:800;color:#1e293b;">📦 LiaGold Scanner</div>
-              <div style="font-size:11px;color:#64748b;margin-top:2px;">Stock Opname · Multiplayer + Merge Solo <b style="color:#16a34a;">v27</b></div>
+              <div style="font-size:11px;color:#64748b;margin-top:2px;">Stock Opname · Multiplayer + Merge Solo <b style="color:#16a34a;">v28</b></div>
             </div>
             <button id="lg-close" style="background:#f1f5f9;border:1px solid #e2e8f0;color:#64748b;border-radius:6px;padding:6px 12px;cursor:pointer;font-size:14px;">✕</button>
           </div>
@@ -2505,7 +2632,6 @@ Lanjutkan?`)) return;
 
           <div id="lg-stats" style="display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-bottom:12px;"></div>
 
-          <!-- ✅ v1.0.9: Filter banner -->
           <div id="lg-filter-banner" style="display:none;padding:10px 14px;background:linear-gradient(90deg,#eff6ff,#dbeafe);border:1.5px solid #93c5fd;border-radius:8px;font-size:12px;color:#1e3a8a;margin-bottom:12px;align-items:center;justify-content:space-between;gap:10px;">
             <span>🔍 <span id="lg-filter-banner-text"></span></span>
             <button id="lg-clear-filter-btn" style="padding:5px 12px;background:#2563eb;color:#fff;border:none;border-radius:5px;cursor:pointer;font-size:11px;font-weight:700;white-space:nowrap;">✕ Reset Filter</button>
@@ -2654,7 +2780,6 @@ Lanjutkan?`)) return;
 
         document.addEventListener('click', onDocClick);
 
-        // ✅ v1.0.9: Tab click juga mereset statusFilter
         panel.querySelectorAll('.lg-scan-tab').forEach(tab => {
           tab.addEventListener('click', () => {
             scanFilter = tab.dataset.val;
