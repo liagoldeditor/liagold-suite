@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         LiaGold Suite — Totalizer + Scanner (Unified)
 // @namespace    liagold.suite.unified
-// @version      1.0.18
-// @description  v1.0.18: Full readable format — Tokenizer + TTL 12 jam + Auto-purge + Sesi tanpa prefix
+// @version      1.0.19
+// @description  v1.0.19: Sliding Window TTL 12 jam — Online & Offline + Countdown Real-time + Tokenizer
 // @match        https://liagold.cuan.co/*
 // @match        http://liagold.cuan.co/*
 // @run-at       document-idle
@@ -753,8 +753,10 @@
       let batchSize = parseInt(localStorage.getItem('lg_batchSize') || '25');
       let batchDelay = parseInt(localStorage.getItem('lg_batchDelay') || '1000');
 
+      // ✅ v1.0.19: Sliding Window TTL
+      let lastScanAt = null;
+      let countdownIntervalId = null;
       let sessionCreatedAt = null;
-      let purgeIntervalId = null;
 
       const sleep = ms => new Promise(r => setTimeout(r, ms));
       const isMulti = () => !!sessionId;
@@ -781,15 +783,150 @@
         }
       }
 
-      function isSessionExpired(createdAt) {
-        if (!createdAt) return false;
-        try {
-          const createdTime = new Date(createdAt).getTime();
-          const age = Date.now() - createdTime;
-          return age > SESSION_TTL_MS;
-        } catch (e) {
-          return false;
+      // ✅ v1.0.19: Update lastScanAt setiap ada scan baru
+      function updateLastScanAt() {
+        lastScanAt = new Date().toISOString();
+        
+        if (isMulti()) {
+          // Mode Online: update ke Firebase
+          fbPut(`/opname/${sessionId}/meta/lastScanAt`, lastScanAt).catch(() => {});
+        } else {
+          // Mode Solo: simpan ke localStorage
+          localStorage.setItem('lg_lastScanAt', lastScanAt);
         }
+        
+        updateCountdownDisplay();
+      }
+
+      // ✅ v1.0.19: Hitung sisa waktu dari lastScanAt
+      function getRemainingTime() {
+        if (!lastScanAt) return 0;
+        
+        const lastScanTime = new Date(lastScanAt).getTime();
+        const expiresAt = lastScanTime + DATA_TTL_MS;
+        const remaining = expiresAt - Date.now();
+        
+        return Math.max(0, remaining);
+      }
+
+      // ✅ v1.0.19: Cek apakah data expired
+      function isDataExpired() {
+        return getRemainingTime() <= 0;
+      }
+
+      // ✅ v1.0.19: Update tampilan countdown
+      function updateCountdownDisplay() {
+        const countdownEl = document.getElementById('lg-countdown');
+        if (!countdownEl) return;
+
+        if (!lastScanAt) {
+          countdownEl.style.display = 'none';
+          return;
+        }
+
+        countdownEl.style.display = 'block';
+        const remaining = getRemainingTime();
+
+        if (remaining <= 0) {
+          countdownEl.innerHTML = '⏰ DATA EXPIRED';
+          countdownEl.style.color = '#dc2626';
+          countdownEl.style.fontWeight = '700';
+          return;
+        }
+
+        const hours = Math.floor(remaining / (60 * 60 * 1000));
+        const minutes = Math.floor((remaining % (60 * 60 * 1000)) / (60 * 1000));
+        const seconds = Math.floor((remaining % (60 * 1000)) / 1000);
+
+        countdownEl.innerHTML = `⏳ Data valid: <b>${hours}j ${minutes}m ${seconds}d</b>`;
+        countdownEl.style.color = remaining < 60 * 60 * 1000 ? '#dc2626' : '#16a34a';
+        countdownEl.style.fontWeight = remaining < 60 * 60 * 1000 ? '700' : '600';
+      }
+
+      // ✅ v1.0.19: Start interval countdown (update setiap detik)
+      function startCountdownInterval() {
+        stopCountdownInterval();
+        countdownIntervalId = setInterval(() => {
+          updateCountdownDisplay();
+          
+          // Auto-purge jika expired
+          if (isDataExpired()) {
+            if (isMulti()) {
+              handleOnlineExpiry();
+            } else {
+              handleSoloExpiry();
+            }
+          }
+        }, 1000);
+      }
+
+      // ✅ v1.0.19: Stop interval countdown
+      function stopCountdownInterval() {
+        if (countdownIntervalId) {
+          clearInterval(countdownIntervalId);
+          countdownIntervalId = null;
+        }
+      }
+
+      // ✅ v1.0.19: Handle expiry untuk mode solo
+      function handleSoloExpiry() {
+        if (scanLog.length === 0) return;
+        
+        updateStatus('🗑️ Data scan expired (>12 jam). Menghapus otomatis...');
+        
+        scanLog = [];
+        scannedCodes = new Set();
+        localStorage.removeItem('lg_scanLog');
+        localStorage.removeItem('lg_lastScanAt');
+        lastScanAt = null;
+        
+        updateStats();
+        renderLog();
+        applyFilters();
+        updateCountdownDisplay();
+        
+        alert('⏰ Data scan telah EXPIRED (>12 jam tanpa scan).\nSemua data scan lokal telah dihapus otomatis.\nMulai scan baru untuk melanjutkan.');
+      }
+
+      // ✅ v1.0.19: Handle expiry untuk mode online
+      async function handleOnlineExpiry() {
+        if (!sessionId || isDeletingSession) return;
+
+        isDeletingSession = true;
+
+        try {
+          updateStatus('🗑️ Data scan expired (>12 jam). Menghapus sesi dari cloud...');
+
+          const res = await fetch(`${FIREBASE}/opname/${sessionId}.json`, { method: 'DELETE' });
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+          cleanupSessionLocal();
+
+          alert('⏰ Data scan telah EXPIRED (>12 jam tanpa scan).\nSesi telah dihapus otomatis dari cloud.\nSemua peserta telah keluar.\n\nBuat sesi baru untuk melanjutkan.');
+        } catch (e) {
+          updateStatus('❌ Gagal hapus sesi expired: ' + e.message);
+        } finally {
+          isDeletingSession = false;
+        }
+      }
+
+      // ✅ v1.0.19: Load lastScanAt saat halaman load
+      async function loadLastScanAt() {
+        if (isMulti()) {
+          // Mode Online: load dari Firebase
+          try {
+            const res = await fetch(`${FIREBASE}/opname/${sessionId}/meta.json`);
+            const meta = await res.json();
+            lastScanAt = meta?.lastScanAt || meta?.dibuat || null;
+          } catch (e) {
+            lastScanAt = null;
+          }
+        } else {
+          // Mode Solo: load dari localStorage
+          lastScanAt = localStorage.getItem('lg_lastScanAt') || null;
+        }
+        
+        updateCountdownDisplay();
       }
 
       async function purgeExpiredEntries() {
@@ -841,72 +978,19 @@
           }
 
           sessionCreatedAt = meta.dibuat || null;
+          lastScanAt = meta.lastScanAt || meta.dibuat || null;
 
-          if (sessionCreatedAt && isSessionExpired(sessionCreatedAt)) {
-            await deleteSessionSilent('expired');
+          if (isDataExpired()) {
+            await handleOnlineExpiry();
             return;
           }
 
-          updateSessionCountdown();
+          updateCountdownDisplay();
         } catch (e) {}
       }
 
-      async function deleteSessionSilent(reason) {
-        if (!sessionId || isDeletingSession) return;
-
-        isDeletingSession = true;
-
-        try {
-          persistScanLog();
-
-          const res = await fetch(`${FIREBASE}/opname/${sessionId}.json`, { method: 'DELETE' });
-          if (!res.ok) throw new Error(`HTTP ${res.status}`);
-
-          cleanupSessionLocal();
-
-          const msg = reason === 'expired' 
-            ? '⏰ Sesi EXPIRED (>12 jam). Semua data dihapus otomatis.'
-            : '🗑️ Sesi dihapus.';
-          
-          updateStatus(msg);
-
-          if (reason === 'expired') {
-            alert(`⏰ Sesi telah EXPIRED (>12 jam).
-Semua data scan telah dihapus otomatis.
-Silakan buat sesi baru untuk melanjutkan.`);
-          }
-        } catch (e) {
-          updateStatus('❌ Gagal hapus sesi: ' + e.message);
-        } finally {
-          isDeletingSession = false;
-        }
-      }
-
       function updateSessionCountdown() {
-        const countdownEl = document.getElementById('lg-session-countdown');
-        if (!countdownEl) return;
-
-        if (!sessionCreatedAt) {
-          countdownEl.style.display = 'none';
-          return;
-        }
-
-        const createdTime = new Date(sessionCreatedAt).getTime();
-        const expiresAt = createdTime + SESSION_TTL_MS;
-        const remaining = expiresAt - Date.now();
-
-        if (remaining <= 0) {
-          countdownEl.innerHTML = '⏰ Sesi EXPIRED';
-          countdownEl.style.color = '#dc2626';
-          return;
-        }
-
-        const hours = Math.floor(remaining / (60 * 60 * 1000));
-        const minutes = Math.floor((remaining % (60 * 60 * 1000)) / (60 * 1000));
-        const seconds = Math.floor((remaining % (60 * 1000)) / 1000);
-
-        countdownEl.innerHTML = `⏳ Sisa: <b>${hours}j ${minutes}m ${seconds}d</b>`;
-        countdownEl.style.color = remaining < 60 * 60 * 1000 ? '#dc2626' : '#16a34a';
+        updateCountdownDisplay();
       }
 
       function mapItem(item) {
@@ -995,6 +1079,16 @@ Silakan buat sesi baru untuk melanjutkan.`);
           .lg-img-link:hover {
             text-decoration: underline !important;
             opacity: 0.85;
+          }
+
+          #lg-countdown {
+            margin-top: 8px;
+            padding: 6px 12px;
+            background: #f8fafc;
+            border: 1px solid #e2e8f0;
+            border-radius: 6px;
+            font-size: 12px;
+            text-align: center;
           }
         `;
         document.head.appendChild(s);
@@ -1346,22 +1440,25 @@ Silakan buat sesi baru untuk melanjutkan.`);
         localStorage.setItem('lg_mp_name', nama);
 
         const code = Math.random().toString(36).substr(2, 6).toUpperCase();
+        const now = new Date().toISOString();
 
         try {
           await fbPut(`/opname/${code}/meta`, {
             nama: 'Opname ' + new Date().toLocaleDateString('id-ID'),
-            dibuat: new Date().toISOString(),
+            dibuat: now,
+            lastScanAt: now,
             expiresAt: new Date(Date.now() + SESSION_TTL_MS).toISOString(),
           });
 
           await fbPut(`/opname/${code}/peserta/${myId}`, {
             nama: myName,
-            join: new Date().toISOString()
+            join: now
           });
 
           sessionId = code;
           localStorage.setItem('lg_session', code);
-          sessionCreatedAt = new Date().toISOString();
+          sessionCreatedAt = now;
+          lastScanAt = now;
 
           knownCloudKeys = new Set();
           initialCloudSyncDone = false;
@@ -1376,9 +1473,9 @@ Silakan buat sesi baru untuk melanjutkan.`);
           await migrateSoloScansToSession();
 
           listenSession();
-          startPurgeInterval();
           updateMpUI();
-          updateSessionCountdown();
+          updateCountdownDisplay();
+          startCountdownInterval();
           updateStatus(`✅ Sesi ${code} dibuat! COPY kodenya & bagikan ke rekan.`);
         } catch (e) {
           updateStatus('❌ Gagal buat sesi: ' + e.message + ' (cek Rules Firebase)');
@@ -1406,8 +1503,11 @@ Silakan buat sesi baru untuk melanjutkan.`);
             return;
           }
 
-          if (meta.dibuat && isSessionExpired(meta.dibuat)) {
-            updateStatus('❌ Sesi "' + code + '" sudah EXPIRED (>12 jam).');
+          lastScanAt = meta.lastScanAt || meta.dibuat || null;
+          sessionCreatedAt = meta.dibuat || null;
+
+          if (isDataExpired()) {
+            updateStatus('❌ Sesi "' + code + '" sudah EXPIRED (>12 jam tanpa scan).');
             return;
           }
 
@@ -1418,7 +1518,6 @@ Silakan buat sesi baru untuk melanjutkan.`);
 
           sessionId = code;
           localStorage.setItem('lg_session', code);
-          sessionCreatedAt = meta.dibuat || new Date().toISOString();
 
           knownCloudKeys = new Set();
           initialCloudSyncDone = false;
@@ -1433,9 +1532,9 @@ Silakan buat sesi baru untuk melanjutkan.`);
           await migrateSoloScansToSession();
 
           listenSession();
-          startPurgeInterval();
           updateMpUI();
-          updateSessionCountdown();
+          updateCountdownDisplay();
+          startCountdownInterval();
           updateStatus(`✅ Bergabung ke sesi ${code}!`);
         } catch (e) {
           updateStatus('❌ Gagal gabung: ' + e.message);
@@ -1448,7 +1547,7 @@ Silakan buat sesi baru untuk melanjutkan.`);
         }
 
         persistScanLog();
-        stopPurgeInterval();
+        stopCountdownInterval();
         cleanupSessionLocal();
         updateStatus('🔴 Keluar dari sesi. Mode solo.');
       }
@@ -1461,6 +1560,7 @@ Silakan buat sesi baru untuk melanjutkan.`);
 
         sessionId = null;
         sessionCreatedAt = null;
+        lastScanAt = null;
         cloudHistory = {};
         participants = {};
         dupeCount = 0;
@@ -1484,7 +1584,7 @@ Silakan buat sesi baru untuk melanjutkan.`);
           formRetryTimer = null;
         }
 
-        stopPurgeInterval();
+        stopCountdownInterval();
 
         localStorage.removeItem('lg_session');
 
@@ -1515,38 +1615,13 @@ Semua device lain akan OTOMATIS keluar.
           const res = await fetch(`${FIREBASE}/opname/${sessionId}.json`, { method: 'DELETE' });
           if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
-          stopPurgeInterval();
+          stopCountdownInterval();
           cleanupSessionLocal();
           updateStatus('🗑️ Sesi dihapus permanen. Semua peserta otomatis keluar.');
         } catch (e) {
           updateStatus('❌ Gagal hapus sesi: ' + e.message);
         } finally {
           isDeletingSession = false;
-        }
-      }
-
-      function startPurgeInterval() {
-        stopPurgeInterval();
-        
-        purgeIntervalId = setInterval(() => {
-          if (isMulti() && !isDeletingSession) {
-            purgeExpiredEntries();
-            checkSessionExpiry();
-          }
-        }, 5 * 60 * 1000);
-
-        setTimeout(() => {
-          if (isMulti() && !isDeletingSession) {
-            purgeExpiredEntries();
-            checkSessionExpiry();
-          }
-        }, 2000);
-      }
-
-      function stopPurgeInterval() {
-        if (purgeIntervalId) {
-          clearInterval(purgeIntervalId);
-          purgeIntervalId = null;
         }
       }
 
@@ -1589,7 +1664,7 @@ Semua device lain akan OTOMATIS keluar.
         if (!sessionId || isDeletingSession) return;
 
         persistScanLog();
-        stopPurgeInterval();
+        stopCountdownInterval();
         cleanupSessionLocal();
         updateStatus('🗑️ Sesi dihapus oleh peserta lain — kamu otomatis keluar.');
 
@@ -1633,6 +1708,12 @@ Data scan di device ini tetap tersimpan lokal.`);
             participants = data.peserta || {};
             dupeCount = data.dupes ? Object.keys(data.dupes).length : 0;
 
+            // ✅ v1.0.19: Update lastScanAt dari meta
+            if (data.meta?.lastScanAt) {
+              lastScanAt = data.meta.lastScanAt;
+              updateCountdownDisplay();
+            }
+
             onCloudUpdate();
             renderParticipants();
             return;
@@ -1656,6 +1737,20 @@ Data scan di device ini tetap tersimpan lokal.`);
             else cloudHistory[k] = data;
 
             onCloudUpdate();
+            return;
+          }
+
+          if (path === '/meta') {
+            if (data?.lastScanAt) {
+              lastScanAt = data.lastScanAt;
+              updateCountdownDisplay();
+            }
+            return;
+          }
+
+          if (path === '/meta/lastScanAt') {
+            lastScanAt = data;
+            updateCountdownDisplay();
             return;
           }
 
@@ -1725,6 +1820,10 @@ Data scan di device ini tetap tersimpan lokal.`);
               if (k === 'history') cloudHistory = v || {};
               if (k === 'peserta') participants = v || {};
               if (k === 'dupes') dupeCount = v ? Object.keys(v).length : 0;
+              if (k === 'meta' && v?.lastScanAt) {
+                lastScanAt = v.lastScanAt;
+                updateCountdownDisplay();
+              }
               
               if (k === 'scans' && v && typeof v === 'object') {
                 Object.entries(v).forEach(([sk, sv]) => {
@@ -1762,6 +1861,20 @@ Data scan di device ini tetap tersimpan lokal.`);
             });
 
             onCloudUpdate();
+            return;
+          }
+
+          if (path === '/meta') {
+            if (data?.lastScanAt) {
+              lastScanAt = data.lastScanAt;
+              updateCountdownDisplay();
+            }
+            return;
+          }
+
+          if (path === '/meta/lastScanAt') {
+            lastScanAt = data;
+            updateCountdownDisplay();
             return;
           }
 
@@ -1854,6 +1967,12 @@ Data scan di device ini tetap tersimpan lokal.`);
               
               participants = data.peserta || {};
               dupeCount = data.dupes ? Object.keys(data.dupes).length : 0;
+
+              // ✅ v1.0.19: Update lastScanAt dari meta
+              if (data.meta?.lastScanAt) {
+                lastScanAt = data.meta.lastScanAt;
+                updateCountdownDisplay();
+              }
 
               onCloudUpdate();
               renderParticipants();
@@ -1951,7 +2070,7 @@ Data scan di device ini tetap tersimpan lokal.`);
           updateStats();
           renderLog();
           applyFilters();
-          updateSessionCountdown();
+          updateCountdownDisplay();
         }, 200);
       }
 
@@ -1996,14 +2115,14 @@ Data scan di device ini tetap tersimpan lokal.`);
                 <b style="font-size:17px;color:#2563eb;letter-spacing:1px;font-family:monospace;">${esc(sessionId)}</b>
                 <button id="lg-mp-copy" style="padding:5px 12px;background:#2563eb;color:#fff;border:none;border-radius:5px;cursor:pointer;font-size:11px;font-weight:600;">📋 Copy</button>
               </div>
-              <div id="lg-session-countdown" style="margin-top:6px;font-size:10px;font-weight:600;"></div>
+              <div id="lg-countdown" style="margin-top:6px;font-size:10px;font-weight:600;"></div>
             </div>
             <div id="lg-mp-participants" style="font-size:11px;color:#475569;margin-bottom:10px;"></div>
             <div style="display:flex;gap:6px;flex-wrap:wrap;">
               <button id="lg-mp-leave" style="padding:7px 14px;background:#dc2626;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:11px;font-weight:600;">🚪 Keluar Sesi</button>
               <button id="lg-mp-delete" style="padding:7px 14px;background:#991b1b;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:11px;font-weight:600;">🗑️ Selesai & Hapus</button>
             </div>
-            <div style="margin-top:8px;font-size:10px;color:#94a3b8;line-height:1.5;">💡 Scan pemain lain otomatis terinput ke form kamu (sinkron real-time). Progress solo otomatis dimerge saat buat/gabung sesi. ⏰ Sesi & data auto-expire 12 jam.</div>
+            <div style="margin-top:8px;font-size:10px;color:#94a3b8;line-height:1.5;">💡 Scan pemain lain otomatis terinput ke form kamu (sinkron real-time). Progress solo otomatis dimerge saat buat/gabung sesi. ⏰ Data auto-expire 12 jam tanpa scan.</div>
           `;
 
           document.getElementById('lg-mp-leave').addEventListener('click', leaveSession);
@@ -2011,13 +2130,14 @@ Data scan di device ini tetap tersimpan lokal.`);
           document.getElementById('lg-mp-copy').addEventListener('click', copySessionCode);
 
           renderParticipants();
-          updateSessionCountdown();
+          updateCountdownDisplay();
         } else {
           box.innerHTML = `
             <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;">
               <span style="width:10px;height:10px;border-radius:50%;background:#94a3b8;display:inline-block;"></span>
               <b style="font-size:13px;color:#64748b;">🔴 Mode Solo (offline)</b>
             </div>
+            <div id="lg-countdown" style="margin-bottom:10px;font-size:10px;font-weight:600;"></div>
             <input id="lg-mp-name" type="text" placeholder="Nama kamu" value="${escAttr(myName)}"
               style="width:100%;padding:8px 10px;border-radius:6px;border:1px solid #cbd5e1;font-size:12px;margin-bottom:8px;" />
             <button id="lg-mp-create" style="width:100%;padding:8px;background:#2563eb;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:11px;font-weight:600;margin-bottom:8px;">➕ Buat Sesi Baru <span style="font-weight:400;opacity:.85;">(progress solo ikut)</span></button>
@@ -2026,10 +2146,13 @@ Data scan di device ini tetap tersimpan lokal.`);
                 style="flex:1;padding:8px 10px;border-radius:6px;border:1px solid #cbd5e1;font-size:12px;text-transform:uppercase;" />
               <button id="lg-mp-join" style="padding:8px 14px;background:#16a34a;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:11px;font-weight:600;">Gabung</button>
             </div>
+            <div style="margin-top:8px;font-size:10px;color:#94a3b8;line-height:1.5;">⏰ Data scan solo auto-expire 12 jam tanpa scan baru.</div>
           `;
 
           document.getElementById('lg-mp-create').addEventListener('click', createSession);
           document.getElementById('lg-mp-join').addEventListener('click', joinSession);
+          
+          updateCountdownDisplay();
         }
       }
 
@@ -2465,6 +2588,9 @@ Data scan di device ini tetap tersimpan lokal.`);
           debouncedPersist();
           scheduleRender();
 
+          // ✅ v1.0.19: Update lastScanAt setiap scan
+          updateLastScanAt();
+
           await pushScanToCloud({
             by: myName,
             time: now.toISOString(),
@@ -2483,6 +2609,9 @@ Data scan di device ini tetap tersimpan lokal.`);
 
           persistScanLog();
           scheduleRender();
+
+          // ✅ v1.0.19: Update lastScanAt setiap scan
+          updateLastScanAt();
         }
 
         showResult(msg, st, imgUrl);
@@ -2784,6 +2913,11 @@ Data scan di device ini tetap tersimpan lokal.`);
           initialCloudSyncDone = false;
           statusFilter = 'none';
 
+          // ✅ v1.0.19: Reset lastScanAt saat reset progress
+          lastScanAt = new Date().toISOString();
+          fbPut(`/opname/${sessionId}/meta/lastScanAt`, lastScanAt).catch(() => {});
+          updateCountdownDisplay();
+
           updateStatus('🔄 Mereset progress sesi…');
         } else {
           if (!confirm('Reset semua progress scan?')) return;
@@ -2795,6 +2929,11 @@ Data scan di device ini tetap tersimpan lokal.`);
           statusFilter = 'none';
 
           localStorage.removeItem('lg_scanLog');
+          
+          // ✅ v1.0.19: Reset lastScanAt saat reset progress
+          lastScanAt = new Date().toISOString();
+          localStorage.setItem('lg_lastScanAt', lastScanAt);
+          updateCountdownDisplay();
 
           updateStats();
           renderLog();
@@ -2914,7 +3053,7 @@ Lanjutkan?`)) return;
           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;padding-bottom:12px;border-bottom:2px solid #e2e8f0;">
             <div>
               <div style="font-size:18px;font-weight:800;color:#1e293b;">📦 LiaGold Scanner</div>
-              <div style="font-size:11px;color:#64748b;margin-top:2px;">Stock Opname · Multiplayer + Merge Solo <b style="color:#16a34a;">v35</b></div>
+              <div style="font-size:11px;color:#64748b;margin-top:2px;">Stock Opname · Multiplayer + Merge Solo <b style="color:#16a34a;">v36</b></div>
             </div>
             <button id="lg-close" style="background:#f1f5f9;border:1px solid #e2e8f0;color:#64748b;border-radius:6px;padding:6px 12px;cursor:pointer;font-size:14px;">✕</button>
           </div>
@@ -3137,9 +3276,14 @@ Lanjutkan?`)) return;
         renderLog();
         updateStats();
 
+        // ✅ v1.0.19: Load lastScanAt saat halaman load
+        loadLastScanAt();
+        
+        // ✅ v1.0.19: Start countdown interval
+        startCountdownInterval();
+
         if (isMulti()) {
           listenSession();
-          startPurgeInterval();
           checkSessionExpiry();
           updateStatus(`🟢 Menyambung ke sesi ${sessionId}…`);
         }
