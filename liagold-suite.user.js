@@ -1,4 +1,3 @@
-```javascript
 // ==UserScript==
 // @name         LiaGold Suite Ultimate (Totalizer + Scanner + Payment Detail)
 // @namespace    liagold.suite.ultimate
@@ -3985,4 +3984,3 @@ setInterval(onRouteChange, 900);
 bootByRoute();
 })();
 })();
-```
